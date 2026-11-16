@@ -52,6 +52,8 @@
 #define BOOT_LEAVE_STEP_NET     0U
 /** @brief The leave step that waits for AO_Radio's answer. */
 #define BOOT_LEAVE_STEP_RADIO   1U
+/** @brief The leave step that waits for AO_Log's answer. */
+#define BOOT_LEAVE_STEP_LOG     2U
 
 _Static_assert(KSET_ZONE_MAX == KODE_CONFIG_VALUE_MAX,
                "a zone is one setting's value, the longest one");
@@ -62,7 +64,7 @@ typedef struct {
     QActive  super;
     QTimeEvt leave;         /**< The bound of the leave step that is running. */
     uint8_t  leave_kind;    /**< kdrv_radio_note_t: the role the jump goes to. */
-    uint8_t  leave_step;    /**< BOOT_LEAVE_STEP_NET or BOOT_LEAVE_STEP_RADIO. */
+    uint8_t  leave_step;    /**< BOOT_LEAVE_STEP_LOG, _NET or _RADIO.          */
 #if CONFIG_KODE_LOWPOWER
     uint8_t  lp_who;        /**< The id lowpower_join() gave.                 */
 #endif
@@ -73,6 +75,8 @@ typedef struct {
                              *   KODE_BOOT_STABLE_MS: one timer, one after the
                              *   other.                                        */
     bool     stable_next;   /**< The healthy timer is on its second count.      */
+    uint8_t  other;         /**< kboot_other_t: what became of the slot that is
+                             *   not running, read before otadata is cleared. */
     QActive *reset_who;     /**< Where the reset's answer goes.                 */
     uint32_t welcome_off;   /**< The welcome app's extent in the apps region.   */
     uint32_t welcome_size;  /**< Its length.                                    */
@@ -261,6 +265,12 @@ void boot_radio_parked(void)
 void boot_net_left(void)
 {
     static const QEvt evt = QEVT_INITIALIZER(BOOT_NET_LEFT_SIG);
+    QACTIVE_POST(AO_Boot, &evt, NULL);
+}
+
+void boot_log_flushed(void)
+{
+    static const QEvt evt = QEVT_INITIALIZER(BOOT_LOG_FLUSHED_SIG);
     QACTIVE_POST(AO_Boot, &evt, NULL);
 }
 
@@ -555,6 +565,34 @@ static void boot_crashes_count(bool after_app)
         }
     }
 }
+
+/**
+ * @brief What became of the kodeOS slot that is not running, from otadata.
+ *
+ * @param st      What the bootloader recorded about that slot.
+ * @param rescued The rescue took over: an update was launched and never
+ *                confirmed. From factory, @p st is ota_0's, which need not be
+ *                the slot written, so it is not read.
+ * @return Its kboot_other_t.
+ */
+static kboot_other_t boot_other_of(kdrv_slot_state_t st, bool rescued)
+{
+    kboot_other_t other = KBOOT_OTHER_GIVEN_UP;
+
+    if ( rescued || (KDRV_SLOT_STATE_ABORTED == st) )
+    {
+        other = KBOOT_OTHER_UNCONFIRMED;
+    }
+    else if ( KDRV_SLOT_STATE_UNDEFINED == st )
+    {
+        other = KBOOT_OTHER_NEVER_RAN;
+    }
+    else
+    {
+        /* Launched, and the bootloader holds something else: given up on. */
+    }
+    return other;
+}
 #endif
 
 /**
@@ -665,8 +703,11 @@ static QState Boot_initial(Boot * const me, void const * const par)
     }
 
     /* 2. Running from factory with otadata non-blank means the rescue took
-     *    over: a kodeOS update died before confirming. Make it sticky. */
-    if ( kdrv_running_is_factory() && !kdrv_otadata_blank() )
+     *    over: a kodeOS update died before confirming. Make it sticky. What
+     *    became of the other slot is read first, while otadata still says. */
+    bool const rescued = kdrv_running_is_factory() && !kdrv_otadata_blank();
+    me->other = (uint8_t)boot_other_of(kdrv_slot_state(), rescued);
+    if ( rescued )
     {
         s_reason = KBOOT_UNEXPECTED;
         (void)kdrv_otadata_clear();
@@ -763,7 +804,7 @@ static void store_set(BootNvsSetEvt const * const e)
 }
 
 /**
- * @brief Second step of the leave: AO_Radio hangs BLE up and parks the C5.
+ * @brief Third step of the leave: AO_Radio hangs BLE up and parks the C5.
  *
  * An app without AO_Radio has nothing to wait for.
  *
@@ -784,18 +825,14 @@ static void leave_radio_step(Boot * const me)
 }
 
 /**
- * @brief Start the leave that ends in a reset.
+ * @brief Second step of the leave: AO_Net's clean stop of the Kode channel.
  *
- * The caller has done whatever must be on flash first. The first step is
- * AO_Net's clean stop of the Kode channel; an app without AO_Net goes on to
- * the second at once. The caller then transitions to Boot_leaving.
+ * An app without AO_Net goes on to the third at once.
  *
- * @param me   AO_Boot.
- * @param kind The role of the firmware the jump goes to.
+ * @param me AO_Boot.
  */
-static void leave_begin(Boot * const me, kdrv_radio_note_t kind)
+static void leave_net_step(Boot * const me)
 {
-    me->leave_kind = (uint8_t)kind;
     me->leave_step = BOOT_LEAVE_STEP_NET;
     if ( kaos_linked(&kaos_net_start) )
     {
@@ -805,6 +842,32 @@ static void leave_begin(Boot * const me, kdrv_radio_note_t kind)
     else
     {
         leave_radio_step(me);
+    }
+}
+
+/**
+ * @brief Start the leave that ends in a reset.
+ *
+ * The caller has done whatever must be on flash first. The first step is
+ * AO_Log's word that the lines posted before the leave are on their ports,
+ * so nothing said just before the jump (an install's last record) is behind
+ * the ports going down; a queue with no room goes on to the second at once.
+ * The caller then transitions to Boot_leaving.
+ *
+ * @param me   AO_Boot.
+ * @param kind The role of the firmware the jump goes to.
+ */
+static void leave_begin(Boot * const me, kdrv_radio_note_t kind)
+{
+    me->leave_kind = (uint8_t)kind;
+    me->leave_step = BOOT_LEAVE_STEP_LOG;
+    if ( log_flush_request() )
+    {
+        QTimeEvt_armX(&me->leave, KQP_TICKS_PER_MS(KODE_LEAVE_LOG_MS), 0U);
+    }
+    else
+    {
+        leave_net_step(me);
     }
 }
 
@@ -1511,6 +1574,9 @@ static QState Boot_active(Boot * const me, QEvt const * const e)
     switch ( e->sig )
     {
         case BOOT_OS_SWITCH_SIG: {
+            /* Published when the board stays on this slot, so the update
+             * that asked is not left waiting for a reset that never comes. */
+            static const QEvt failed = QEVT_INITIALIZER(BOOT_OS_SWITCH_FAIL_SIG);
 #if CONFIG_KODEOS_BOOT_ROLE_OS
             /* Before otadata moves: confirming marks the slot otadata names,
              * which from then on is the new one. */
@@ -1519,11 +1585,13 @@ static QState Boot_active(Boot * const me, QEvt const * const e)
             if ( !kdrv_slot_present() )
             {
                 KLOG_E(TAG, "no inactive kodeOS slot in the partition table");
+                QACTIVE_PUBLISH(&failed, &me->super);
             }
             else if ( !kdrv_slot_has_image() )
             {
                 KLOG_E(TAG, "the inactive kodeOS slot holds no valid image - "
                             "nothing to switch to");
+                QACTIVE_PUBLISH(&failed, &me->super);
             }
             /* kdrv_otadata_select_slot verifies the image before writing, so
              * a corrupt slot is refused here rather than at the next boot. */
@@ -1540,6 +1608,7 @@ static QState Boot_active(Boot * const me, QEvt const * const e)
             {
                 /* Said, or a failed write would look like an update in progress. */
                 KLOG_E(TAG, "could not write otadata - staying on this slot");
+                QACTIVE_PUBLISH(&failed, &me->super);
             }
             status = Q_HANDLED();
             break;
@@ -1615,7 +1684,23 @@ static QState Boot_active(Boot * const me, QEvt const * const e)
             }
             else
             {
+                BootStableEvt * const ev = Q_NEW_X(BootStableEvt, 0U, BOOT_STABLE_SIG);
+
                 kdrv_slot_crashes_set(0U);
+                /* The minute that settles a kodeOS update: where kodeOS runs
+                 * and what became of the other slot. AO_AppMgr compares the
+                 * first with the slot it wrote. */
+                if ( NULL != ev )
+                {
+                    kdrv_running_info(NULL, &ev->running, NULL);
+                    ev->other = me->other;
+                    QACTIVE_PUBLISH(&ev->super, &me->super);
+                }
+                else
+                {
+                    KLOG_W(TAG, "no event for the stable minute; a kodeOS "
+                                "update waiting on it stays rebooting");
+                }
             }
             status = Q_HANDLED();
             break;
@@ -1744,7 +1829,7 @@ static QState Boot_active(Boot * const me, QEvt const * const e)
 }
 
 /**
- * @brief The leave: AO_Net, then AO_Radio, then the reset.
+ * @brief The leave: AO_Log, AO_Net, then AO_Radio, then the reset.
  *
  * The substate of Boot_active that a restart request enters once its
  * pre-reset write is done. Every restart request and home gesture is dropped
@@ -1760,6 +1845,19 @@ static QState Boot_leaving(Boot * const me, QEvt const * const e)
     QState status;
     switch ( e->sig )
     {
+        case BOOT_LOG_FLUSHED_SIG: {
+            if ( BOOT_LEAVE_STEP_LOG == me->leave_step )
+            {
+                (void)QTimeEvt_disarm(&me->leave);
+                leave_net_step(me);
+            }
+            else
+            {
+                KLOG_D(TAG, "a late answer from AO_Log is ignored");
+            }
+            status = Q_HANDLED();
+            break;
+        }
         case BOOT_NET_LEFT_SIG: {
             if ( BOOT_LEAVE_STEP_NET == me->leave_step )
             {
@@ -1791,6 +1889,11 @@ static QState Boot_leaving(Boot * const me, QEvt const * const e)
                 /* The step before ran out as its answer arrived; the timer
                  * counting now is the next step's, not this one. */
                 KLOG_D(TAG, "a stale leave timeout is ignored");
+            }
+            else if ( BOOT_LEAVE_STEP_LOG == me->leave_step )
+            {
+                KLOG_W(TAG, "AO_Log did not answer in time; going on");
+                leave_net_step(me);
             }
             else if ( BOOT_LEAVE_STEP_NET == me->leave_step )
             {

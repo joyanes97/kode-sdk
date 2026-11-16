@@ -308,6 +308,13 @@ enum KodeSignals {
                                  *   (ChannelStateEvt). Every change of state,
                                  *   and on request - the MQTT_STATE_SIG
                                  *   pattern.                                */
+    CONSOLE_SENT_SIG,           /**< AO_Log (BLE) or AO_Net (the Kode
+                                 *   channel): a line written with
+                                 *   kode_log_reply_confirm() left the board on
+                                 *   that port, or could not (ConsoleSentEvt).
+                                 *   It answers the last such line sent there,
+                                 *   and every line before it: two confirmed
+                                 *   lines close together may get one.     */
     CONSOLE_LINE_SIG,           /**< AO_Log: a finished command line. Published
                                  *   rather than posted to AO_Console: AO_Log
                                  *   owns the device, not the policy, and must
@@ -332,6 +339,15 @@ enum KodeSignals {
                                  *   prints it, the GUI draws it.             */
     BOOT_STATE_SIG,             /**< AO_Boot: the boot state, in answer to
                                  *   BOOT_INFO_REQ_SIG (BootStateEvt).        */
+    BOOT_STABLE_SIG,            /**< AO_Boot: the kodeOS running has stayed
+                                 *   up KODE_BOOT_STABLE_MS: where it runs and
+                                 *   what became of the other slot
+                                 *   (BootStableEvt). Once per boot, OS role
+                                 *   only.                                    */
+    BOOT_OS_SWITCH_FAIL_SIG,    /**< AO_Boot: a BOOT_OS_SWITCH_SIG could not
+                                 *   point otadata at the other slot; the
+                                 *   board stays on this one. A bare static
+                                 *   QEvt.                                    */
     GUI_STATE_SIG,              /**< AO_Gui: what state the interface is in,
                                  *   in answer to GUI_DUMP_REQ_SIG
                                  *   (GuiStateEvt).                           */
@@ -590,6 +606,10 @@ enum KodeSignals {
                                  *   install (FLASH_REQ_SIG) or run
                                  *   (APP_RUN_REQ_SIG) request that named one
                                  *   (AppReqRspEvt). Posted, not published.   */
+    INSTALL_INFO_REQ_SIG,       /**< AO_AppMgr: write the records of the
+                                 *   last app install and the last kodeOS
+                                 *   update to the asker's port, then post
+                                 *   it APP_REQ_RSP_SIG (InstallInfoReqEvt). */
     STORAGE_CMD_SIG,            /**< AO_Storage: do StorageCmdEvt.op.         */
     STORAGE_LIST_PAGE_SIG,      /**< AO_Storage: post a page of the bootable
                                  *   images on every medium to the asker
@@ -832,6 +852,10 @@ enum KodeSignals {
                                  *   Kode channel for the jump - the client
                                  *   stopped cleanly, or there was none. One
                                  *   per NET_LEAVE_REQ_SIG.                   */
+    BOOT_LOG_FLUSHED_SIG,       /**< AO_Boot private (direct post, from
+                                 *   boot_log_flushed()): AO_Log has written
+                                 *   every line posted before the leave began.
+                                 *   One per LOG_FLUSH_REQ_SIG.               */
     BOOT_LEAVE_TMO_SIG,         /**< AO_Boot private QTimeEvt: the step of the
                                  *   leave that is running ran out of time.   */
     FACTORY_RESET_REQ_SIG,      /**< AO_Boot: forget everything the board
@@ -2042,6 +2066,11 @@ enum KodeSignals {
                                  *   with LOG_DOCK_SIG.                       */
     LOG_DOCK_SIG,               /**< To the asker: the dock's pins are lent or
                                  *   back (LogDockEvt).                       */
+    LOG_FLUSH_REQ_SIG,          /**< AO_Log: answer AO_Boot with
+                                 *   boot_log_flushed() (log_flush_request()).
+                                 *   Its place in the queue is the point: every
+                                 *   line posted before it is on its ports
+                                 *   first.                                   */
     TEST_DOT_REQ_SIG,           /**< AO_TestDot: a station verb from the
                                  *   console (TestDotReqEvt). Answered with
                                  *   TEST_DOT_REC_SIG records and one
@@ -2292,6 +2321,10 @@ typedef struct {
     uint8_t  src_kind;                 /**< kfw_src_t, as a plain integer.  */
     uint8_t  dst_kind;                 /**< kfw_target_t, likewise.         */
     bool     launch;                   /**< Boot it once written.           */
+    uint8_t  asker_src;                /**< KODE_CONSOLE_SRC_* of the command
+                                        *   that asked, where the install's
+                                        *   record goes; KODE_LOG_SRC_NONE
+                                        *   when no command did.            */
     QActive *who;                      /**< Where AO_AppMgr's verdict is
                                         *   posted (AppReqRspEvt), or NULL
                                         *   for none.                       */
@@ -2317,6 +2350,18 @@ typedef struct {
     QEvt    super;
     uint8_t verdict;   /**< app_req_verdict_t. */
 } AppReqRspEvt;
+
+/**
+ * @brief Ask AO_AppMgr for the records of its last installs (INSTALL_INFO_REQ_SIG).
+ *
+ * AO_AppMgr writes them to @c src itself, so they reach the port before the
+ * APP_REQ_RSP_SIG it posts @c who after them.
+ */
+typedef struct {
+    QEvt     super;
+    QActive *who;   /**< Where APP_REQ_RSP_SIG is posted once the records are out. */
+    uint8_t  src;   /**< KODE_CONSOLE_SRC_* of the command that asked.             */
+} InstallInfoReqEvt;
 
 /**
  * @brief One installed app, in answer to APP_LIST_REQ_SIG (APP_ENTRY_SIG).
@@ -5411,6 +5456,13 @@ typedef struct {
     uint8_t err;        /**< kdrv_mqtt_err_t: meaningful when not up.       */
 } MqttStateEvt;
 
+/** @brief Whether a confirmed console line left the board (CONSOLE_SENT_SIG). */
+typedef struct {
+    QEvt    super;
+    uint8_t src;        /**< KODE_CONSOLE_SRC_BLE or KODE_CONSOLE_SRC_NET.  */
+    bool    ok;         /**< true: the far end has it; false: it is lost.   */
+} ConsoleSentEvt;
+
 /** @brief Where the Kode channel stands (CHANNEL_STATE_SIG). */
 typedef struct {
     QEvt     super;
@@ -6540,6 +6592,19 @@ typedef struct {
     uint8_t  app_end;       /**< kboot_app_end_t: how the app before this
                              *   boot ended.                                 */
 } BootStateEvt;
+
+/**
+ * @brief The kodeOS running has stayed up a minute (BOOT_STABLE_SIG).
+ *
+ * What settles a kodeOS update: the install's owner compares @c running with
+ * the slot it wrote, and when they differ @c other says why.
+ */
+typedef struct {
+    QEvt     super;
+    uint32_t running;       /**< Where the partition running starts.         */
+    uint8_t  other;         /**< kboot_other_t: what became of the slot that
+                             *   is not running.                             */
+} BootStableEvt;
 
 /* Where the interface's drag is, kode_gui_gesture_t.drag. */
 #define KODE_GUI_DRAG_IDLE    0U  /**< No drag is on.                       */

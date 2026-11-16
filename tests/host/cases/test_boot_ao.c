@@ -84,6 +84,46 @@ static void answer_net_left(void)
     QASM_DISPATCH(AO_Boot, &e, 0U);
 }
 
+/**
+ * @brief AO_Log answers the leave's first step, as boot_log_flushed() posts it.
+ *
+ * Its request must be in AO_Log's queue, once: the leave asks AO_Log before
+ * anyone takes a port down.
+ */
+static void answer_log_flushed(void)
+{
+    static const QEvt flushed = QEVT_INITIALIZER(BOOT_LOG_FLUSHED_SIG);
+    const QEvt *e       = NULL;
+    unsigned    flushes = 0U;
+
+    while ( (NULL != AO_Log->eQueue)
+            && (xQueueReceive(AO_Log->eQueue, &e, 0U) == pdTRUE) )
+    {
+        if ( (QSignal)LOG_FLUSH_REQ_SIG == e->sig )
+        {
+            ++flushes;
+        }
+        QF_gc(e);
+    }
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1U, flushes,
+        "the leave asks AO_Log first, and once");
+    QASM_DISPATCH(AO_Boot, &flushed, 0U);
+}
+
+/** @brief AO_Log's queue holds no second request of the leave. */
+static void answer_log_flushed_none(void)
+{
+    const QEvt *e = NULL;
+
+    while ( (NULL != AO_Log->eQueue)
+            && (xQueueReceive(AO_Log->eQueue, &e, 0U) == pdTRUE) )
+    {
+        TEST_ASSERT_NOT_EQUAL_MESSAGE((int)LOG_FLUSH_REQ_SIG, (int)e->sig,
+            "AO_Log is asked once per leave");
+        QF_gc(e);
+    }
+}
+
 /** @brief AO_Radio answers the park request, as boot_radio_parked() posts it. */
 static void answer_radio_parked(void)
 {
@@ -119,6 +159,7 @@ static void finish_leave(void)
 static void dispatch_through_leave(const QEvt *e)
 {
     QASM_DISPATCH(AO_Boot, e, 0U);
+    answer_log_flushed();
     answer_net_left();
     answer_radio_parked();
 }
@@ -162,6 +203,29 @@ static kode_status_t slot_reject(int calls)
 
 /** @brief The boot runs from factory, with otadata blank. */
 static bool s_on_factory;
+
+/** @brief What otadata says of the slot that is not running, on the next boot. */
+static kdrv_slot_state_t s_other_state = KDRV_SLOT_STATE_UNDEFINED;
+
+/** @brief Where the kodeOS running starts, as kdrv_running_info() answers. */
+static uint32_t s_running_at;
+
+static void running_info(const char **label, uint32_t *address, uint32_t *size, int calls)
+{
+    (void)calls;
+    if ( NULL != label )
+    {
+        *label = "ota_0";
+    }
+    if ( NULL != address )
+    {
+        *address = s_running_at;
+    }
+    if ( NULL != size )
+    {
+        *size = 0U;
+    }
+}
 
 /** @brief How many times the running image was asked to confirm itself. */
 static unsigned s_confirms;
@@ -219,6 +283,8 @@ static void boot_up(int reset_reason, bool rescued)
     kdrv_slot_crashes_StubWithCallback(&crashes_read);
     kdrv_slot_crashes_set_StubWithCallback(&crashes_write);
     kdrv_slot_reject_self_StubWithCallback(&slot_reject);
+    kdrv_slot_state_IgnoreAndReturn(s_other_state);
+    kdrv_running_info_StubWithCallback(&running_info);
     kdrv_reset_reason_IgnoreAndReturn(reset_reason);
     kdrv_running_is_factory_IgnoreAndReturn(rescued);
     if ( rescued )
@@ -702,6 +768,163 @@ TEST_CASE("an ordinary boot confirms nothing", "[boot_ao]")
 
     TEST_ASSERT_EQUAL_UINT(0U, log_lines_with("kodeOS update confirmed"));
     update_done();
+}
+
+/** @brief How many of @p sig the spy holds; the rest it held are dropped. */
+static unsigned spy_held(enum_t sig)
+{
+    unsigned n = 0U;
+
+    for ( const QEvt *e = ao_spy_take(); NULL != e; e = ao_spy_take() )
+    {
+        if ( sig == (enum_t)e->sig )
+        {
+            ++n;
+        }
+    }
+    ao_spy_drain();
+    return n;
+}
+
+/** @brief The minute AO_Boot published, or a zeroed one when it published none. */
+static BootStableEvt s_stable;
+
+/** @brief How many BOOT_STABLE_SIG the spy holds; the last is kept in s_stable. */
+static unsigned stable_held(void)
+{
+    unsigned n = 0U;
+
+    for ( const QEvt *e = ao_spy_take(); NULL != e; e = ao_spy_take() )
+    {
+        if ( (enum_t)BOOT_STABLE_SIG == (enum_t)e->sig )
+        {
+            s_stable = *Q_EVT_CAST(BootStableEvt);
+            ++n;
+        }
+    }
+    ao_spy_drain();
+    return n;
+}
+
+/* The minute that settles a kodeOS update is published, once, with where kodeOS
+ * runs, so the owner of the install can say whether that is the slot it wrote. */
+TEST_CASE("a kodeOS that stays up a minute publishes that minute, once",
+          "[boot_ao]")
+{
+    unsigned early;
+    unsigned at;
+    unsigned later;
+
+    (void)memset(&s_stable, 0, sizeof(s_stable));
+    s_running_at = 0x420000U;
+    update_boots();
+    boot_system_up();
+    ao_spy_drain();
+    ao_spy_subscribe(BOOT_STABLE_SIG);
+
+    boot_wait(KODE_BOOT_STABLE_MS - 10U);
+    early = stable_held();
+    boot_wait(10U);
+    at = stable_held();
+    boot_wait(KODE_BOOT_STABLE_MS);
+    later = stable_held();
+
+    QActive_unsubscribe(ao_spy(), BOOT_STABLE_SIG);
+    s_update_pending = false;
+    s_running_at     = 0U;
+    Mockkdrv_slot_Destroy();
+    TEST_ASSERT_EQUAL_UINT(0U, early);
+    TEST_ASSERT_EQUAL_UINT(1U, at);
+    TEST_ASSERT_EQUAL_UINT(0U, later);
+    TEST_ASSERT_EQUAL_HEX32(0x420000U, s_stable.running);
+    TEST_ASSERT_EQUAL_UINT8(KBOOT_OTHER_NEVER_RAN, s_stable.other);
+}
+
+/**
+ * @brief Boot with otadata saying @p st of the other slot, run the minute out
+ *        and hand back what it said of that slot.
+ *
+ * @param st      otadata's word for the slot that is not running.
+ * @param rescued The boot runs from factory after the rescue took over.
+ * @param factory The boot runs from factory with otadata blank.
+ * @return BootStableEvt.other, or 0xFF when no minute was published.
+ */
+static uint8_t other_after_minute(kdrv_slot_state_t st, bool rescued, bool factory)
+{
+    uint8_t other = 0xFFU;
+
+    Mockkdrv_slot_Init();
+    crashes_none();
+    s_other_state = st;
+    s_on_factory  = factory;
+    boot_up((int)KDRV_RESET_POWERON, rescued);
+    s_other_state = KDRV_SLOT_STATE_UNDEFINED;
+    s_on_factory  = false;
+    boot_system_up();
+    ao_spy_drain();
+    ao_spy_subscribe(BOOT_STABLE_SIG);
+    boot_wait(KODE_BOOT_STABLE_MS);
+    if ( 1U == stable_held() )
+    {
+        other = s_stable.other;
+    }
+    QActive_unsubscribe(ao_spy(), BOOT_STABLE_SIG);
+    Mockkdrv_slot_Destroy();
+    return other;
+}
+
+/* What became of the other slot is otadata's, read on the way up before the
+ * rescue clears it. Back on factory after the rescue took over, that slot was
+ * launched whatever otadata says, so the update did not hold; it was not a
+ * switch that never happened. Factory with otadata blank never switched. */
+TEST_CASE("the minute says what became of the other slot, factory's rescue included",
+          "[boot_ao]")
+{
+    TEST_ASSERT_EQUAL_UINT8(KBOOT_OTHER_UNCONFIRMED,
+                            other_after_minute(KDRV_SLOT_STATE_ABORTED, false, false));
+    TEST_ASSERT_EQUAL_UINT8(KBOOT_OTHER_GIVEN_UP,
+                            other_after_minute(KDRV_SLOT_STATE_OTHER, false, false));
+    TEST_ASSERT_EQUAL_UINT8(KBOOT_OTHER_NEVER_RAN,
+                            other_after_minute(KDRV_SLOT_STATE_UNDEFINED, false, false));
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(KBOOT_OTHER_UNCONFIRMED,
+        other_after_minute(KDRV_SLOT_STATE_UNDEFINED, true, false),
+        "the rescue took over: the update ran and did not hold");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(KBOOT_OTHER_NEVER_RAN,
+        other_after_minute(KDRV_SLOT_STATE_UNDEFINED, false, true),
+        "factory with otadata blank never switched");
+}
+
+/* A switch that cannot be made leaves the board where it is: the update that
+ * asked is told, or it would wait for a reset that never comes. */
+TEST_CASE("a switch to the other slot that cannot be made is published",
+          "[boot_ao]")
+{
+    static const QEvt e = QEVT_INITIALIZER(BOOT_OS_SWITCH_SIG);
+    unsigned no_image;
+    unsigned no_write;
+
+    Mockkdrv_slot_Init();
+    boot_fresh();
+    ao_spy_drain();
+    ao_spy_subscribe(BOOT_OS_SWITCH_FAIL_SIG);
+
+    kdrv_slot_present_ExpectAndReturn(true);
+    kdrv_slot_has_image_ExpectAndReturn(false);
+    QASM_DISPATCH(AO_Boot, &e, 0U);
+    no_image = spy_held(BOOT_OS_SWITCH_FAIL_SIG);
+
+    kdrv_slot_present_ExpectAndReturn(true);
+    kdrv_slot_has_image_ExpectAndReturn(true);
+    kdrv_otadata_select_slot_ExpectAndReturn(KODE_ERROR);
+    QASM_DISPATCH(AO_Boot, &e, 0U);
+    no_write = spy_held(BOOT_OS_SWITCH_FAIL_SIG);
+
+    QActive_unsubscribe(ao_spy(), BOOT_OS_SWITCH_FAIL_SIG);
+    Mockkdrv_slot_Verify();
+    Mockkdrv_slot_Destroy();
+    TEST_ASSERT_EQUAL_UINT(0U, fake_system_restarts());
+    TEST_ASSERT_EQUAL_UINT(1U, no_image);
+    TEST_ASSERT_EQUAL_UINT(1U, no_write);
 }
 
 /* At the next reset the bootloader turns a pending slot into an aborted one, and
@@ -1496,6 +1719,7 @@ TEST_CASE("a held bottom button announces home and leaves after the grace",
     (void)qf_support_tick(AO_Boot, 1U);
     TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, fake_system_restarts(),
         "the expiry begins the leave; the reset is the leave's end");
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
     answer_net_left();
     finish_leave();
@@ -1553,6 +1777,7 @@ TEST_CASE("a deferral holds the reset until the app says go", "[boot_ao]")
     (void)qf_support_tick(AO_Boot, 1U);   /* HOME_NOW arrives: the leave begins */
     TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, fake_system_restarts(),
         "going home now leaves first, it does not reset in the same step");
+    answer_log_flushed();
     if ( setjmp(*fake_system_arm_restart()) == 0 )
     {
         answer_net_left();
@@ -1588,6 +1813,7 @@ TEST_CASE("a deferral that never resolves still comes home at the cap",
     (void)qf_support_tick(AO_Boot, 1U);
     TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, fake_system_restarts(),
         "the cap begins the leave; the reset is the leave's end");
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
     answer_net_left();
     finish_leave();
@@ -1636,6 +1862,7 @@ TEST_CASE("app_run writes the request, leaves, then resets", "[boot_ao]")
         "the request is written before anything is asked of the neighbours");
     TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, fake_system_restarts(),
         "the leave comes first: no reset yet");
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
     TEST_ASSERT_EQUAL_INT_MESSAGE(-1, mailbox_take(AO_Radio, NULL),
         "the radio is asked after the network, not with it");
@@ -1672,6 +1899,7 @@ TEST_CASE("kode_sys_exit_to_os posts its request and returns, then parks for the
     TEST_ASSERT_EQUAL_UINT(0U, fake_system_restarts());
 
     QASM_DISPATCH(AO_Boot, &exit_evt, 0U);
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
     answer_net_left();
     TEST_ASSERT_EQUAL_INT((int)RADIO_PARK_REQ_SIG,
@@ -1695,6 +1923,7 @@ TEST_CASE("HOME now parks for the OS", "[boot_ao]")
 
     hold_bot();
     QASM_DISPATCH(AO_Boot, &now_evt, 0U);
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
     answer_net_left();
     TEST_ASSERT_EQUAL_INT((int)RADIO_PARK_REQ_SIG,
@@ -1722,6 +1951,7 @@ TEST_CASE("install dst=os parks for the OS after the slot is selected",
     kdrv_otadata_select_slot_ExpectAndReturn(KODE_OK);
     QASM_DISPATCH(AO_Boot, &e, 0U);
     TEST_ASSERT_EQUAL_UINT(0U, fake_system_restarts());
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
     answer_net_left();
     TEST_ASSERT_EQUAL_INT((int)RADIO_PARK_REQ_SIG,
@@ -1763,6 +1993,7 @@ TEST_CASE("a silent AO_Net does not hold the jump", "[boot_ao]")
     boot_fresh();
 
     QASM_DISPATCH(AO_Boot, &e, 0U);
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
 
     (void)qf_support_tick(AO_Boot, QF_SUPPORT_STEPS(KODE_LEAVE_NET_MS) - 1U);
@@ -1787,6 +2018,7 @@ TEST_CASE("a silent AO_Radio does not hold the jump", "[boot_ao]")
     boot_fresh();
 
     QASM_DISPATCH(AO_Boot, &e, 0U);
+    answer_log_flushed();
     answer_net_left();
     mailboxes_drain();
 
@@ -1816,6 +2048,7 @@ TEST_CASE("a second restart request while leaving is dropped", "[boot_ao]")
 
     QASM_DISPATCH(AO_Boot, &e.super, 0U);
     TEST_ASSERT_TRUE(new_request_on_flash());
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
 
     /* The first request wins: take its record away, so a second write shows. */
@@ -1834,6 +2067,7 @@ TEST_CASE("a second restart request while leaving is dropped", "[boot_ao]")
         "and asked the network for nothing");
     TEST_ASSERT_EQUAL_UINT(0U, fake_system_restarts());
 
+    answer_log_flushed_none();
     answer_net_left();
     TEST_ASSERT_EQUAL_INT((int)RADIO_PARK_REQ_SIG, mailbox_take(AO_Radio, NULL));
     TEST_ASSERT_EQUAL_INT_MESSAGE(-1, mailbox_take(AO_Radio, NULL),
@@ -1863,6 +2097,7 @@ TEST_CASE("the HOME grace expiry leaves, then resets", "[boot_ao]")
 
     TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, fake_system_restarts(),
         "the grace expiry begins the leave, it does not reset in the same step");
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT_MESSAGE((int)NET_LEAVE_REQ_SIG,
                                   mailbox_take(AO_Net, NULL),
         "the network is asked to leave cleanly");
@@ -1887,6 +2122,7 @@ TEST_CASE("a silent neighbour does not hold the grace expiry's leave",
 
     hold_bot();
     (void)qf_support_tick(AO_Boot, QF_SUPPORT_STEPS(KODE_SYS_HOME_GRACE_MS));
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
 
     /* Neither AO answers: the two bounds run out and the board resets. */
@@ -1911,6 +2147,7 @@ TEST_CASE("a grace or a hold during a leave starts nothing new", "[boot_ao]")
     boot_fresh();
 
     QASM_DISPATCH(AO_Boot, &exit_evt, 0U);
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
     before = fake_klog_count();
 
@@ -1929,6 +2166,7 @@ TEST_CASE("a grace or a hold during a leave starts nothing new", "[boot_ao]")
     TEST_ASSERT_FALSE_MESSAGE(boot_home_pending(),
         "a hold during the leave arms no new grace");
 
+    answer_log_flushed_none();
     answer_net_left();
     TEST_ASSERT_EQUAL_INT((int)RADIO_PARK_REQ_SIG, mailbox_take(AO_Radio, NULL));
     TEST_ASSERT_EQUAL_INT_MESSAGE(-1, mailbox_take(AO_Radio, NULL),
@@ -1942,6 +2180,86 @@ TEST_CASE("a grace or a hold during a leave starts nothing new", "[boot_ao]")
     Mockkdrv_slot_Destroy();
 }
 
+/* The leave's first step is AO_Log's: a line posted to it before the jump
+ * (an install's last record) is in the Kode channel's and the BLE console's
+ * rings before AO_Net or AO_Radio is asked to take them down. The step costs
+ * no time of its own: AO_Log's answer ends it. */
+TEST_CASE("the leave asks AO_Log before it asks AO_Net", "[boot_ao]")
+{
+    static const QEvt e = QEVT_INITIALIZER(BOOT_EXIT_REQ_SIG);
+
+    Mockkdrv_slot_Init();
+    boot_fresh();
+
+    QASM_DISPATCH(AO_Boot, &e, 0U);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(-1, mailbox_take(AO_Net, NULL),
+        "AO_Net waits for AO_Log's word");
+    TEST_ASSERT_EQUAL_INT(-1, mailbox_take(AO_Radio, NULL));
+
+    answer_log_flushed();
+    TEST_ASSERT_EQUAL_INT_MESSAGE((int)NET_LEAVE_REQ_SIG,
+                                  mailbox_take(AO_Net, NULL),
+        "AO_Log's word is the network's turn, with no tick between");
+
+    answer_log_flushed_none();
+    answer_net_left();
+    finish_leave();
+    Mockkdrv_slot_Verify();
+    Mockkdrv_slot_Destroy();
+}
+
+TEST_CASE("a silent AO_Log does not hold the jump", "[boot_ao]")
+{
+    static const QEvt e = QEVT_INITIALIZER(BOOT_EXIT_REQ_SIG);
+
+    Mockkdrv_slot_Init();
+    boot_fresh();
+
+    QASM_DISPATCH(AO_Boot, &e, 0U);
+    (void)qf_support_tick(AO_Boot, QF_SUPPORT_STEPS(KODE_LEAVE_LOG_MS) - 1U);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(-1, mailbox_take(AO_Net, NULL),
+        "one tick short of the bound, AO_Log still has the floor");
+
+    (void)qf_support_tick(AO_Boot, 1U);
+    TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
+
+    answer_net_left();
+    finish_leave();
+    Mockkdrv_slot_Verify();
+    Mockkdrv_slot_Destroy();
+}
+
+/** @brief Posts that fill any AO_Log queue the host build gives it. */
+#define LOG_FILL_MAX  256U
+
+TEST_CASE("a full AO_Log queue sends the leave straight to AO_Net", "[boot_ao]")
+{
+    static const QEvt e = QEVT_INITIALIZER(BOOT_EXIT_REQ_SIG);
+
+    Mockkdrv_slot_Init();
+    boot_fresh();
+
+    /* An event nobody reads, posted until only the margin is left. */
+    static const QEvt filler = QEVT_INITIALIZER(LOG_DOCK_SIG);
+    for ( uint32_t guard = 0U;
+          (LOG_FILL_MAX > guard)
+          && (uxQueueSpacesAvailable(AO_Log->eQueue) > KQP_LOG_CMD_MARGIN);
+          ++guard )
+    {
+        QACTIVE_POST(AO_Log, &filler, NULL);
+    }
+    QASM_DISPATCH(AO_Boot, &e, 0U);
+    TEST_ASSERT_EQUAL_INT_MESSAGE((int)NET_LEAVE_REQ_SIG,
+                                  mailbox_take(AO_Net, NULL),
+        "with no room to ask AO_Log, the network is asked at once");
+    answer_log_flushed_none();
+
+    answer_net_left();
+    finish_leave();
+    Mockkdrv_slot_Verify();
+    Mockkdrv_slot_Destroy();
+}
+
 TEST_CASE("a late answer after the reset step is ignored", "[boot_ao]")
 {
     static const QEvt e   = QEVT_INITIALIZER(BOOT_EXIT_REQ_SIG);
@@ -1951,6 +2269,7 @@ TEST_CASE("a late answer after the reset step is ignored", "[boot_ao]")
     boot_fresh();
 
     QASM_DISPATCH(AO_Boot, &e, 0U);
+    answer_log_flushed();
     answer_net_left();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
     TEST_ASSERT_EQUAL_INT((int)RADIO_PARK_REQ_SIG, mailbox_take(AO_Radio, NULL));
@@ -1974,9 +2293,10 @@ TEST_CASE("a late answer after the reset step is ignored", "[boot_ao]")
 }
 
 /* An app that never linked AO_Net or AO_Radio has nobody to ask on the way
- * out: AO_Boot names both weakly, and the leave resets at once, with no
- * answer to wait for and nothing posted. */
-TEST_CASE("an app with neither AO_Net nor AO_Radio leaves at once", "[boot_ao]")
+ * out but AO_Log, which is in every app: AO_Boot names the two weakly, and
+ * the leave resets on AO_Log's word, with nothing posted to them. */
+TEST_CASE("an app with neither AO_Net nor AO_Radio leaves on AO_Log's word",
+          "[boot_ao]")
 {
     static const QEvt e = QEVT_INITIALIZER(BOOT_EXIT_REQ_SIG);
 
@@ -1986,9 +2306,10 @@ TEST_CASE("an app with neither AO_Net nor AO_Radio leaves at once", "[boot_ao]")
     fake_kaos_absent(&kaos_net_start);
     fake_kaos_absent(&kaos_radio_start);
 
+    QASM_DISPATCH(AO_Boot, &e, 0U);
     if ( setjmp(*fake_system_arm_restart()) == 0 )
     {
-        QASM_DISPATCH(AO_Boot, &e, 0U);
+        answer_log_flushed();
         TEST_FAIL_MESSAGE("the board should have reset");
     }
 
@@ -2325,6 +2646,7 @@ TEST_CASE("a restart on its way refuses the round; a settled boot is ready",
     lp_expect_answer(true, "restart pending");
     lp_expect_no_more();
 
+    answer_log_flushed();
     if ( setjmp(*fake_system_arm_restart()) == 0 )
     {
         answer_net_left();
@@ -2346,6 +2668,7 @@ TEST_CASE("a home grace an app asked for refuses the round until it runs out",
     lp_expect_answer(true, "home pending");
 
     (void)qf_support_tick(AO_Boot, QF_SUPPORT_STEPS(KODE_SYS_HOME_GRACE_MS));
+    answer_log_flushed();
     answer_net_left();
     finish_leave();
     mailboxes_drain();
@@ -3889,6 +4212,7 @@ TEST_CASE("a reset asked during a leave is refused", "[boot_ao][reset]")
     expect_reply(KBOOT_RESET_STEP_FIND, KODE_NO_RESOURCES);
     TEST_ASSERT_EQUAL_INT_MESSAGE(-1, mailbox_sig(AO_AppMgr), "nothing asked");
 
+    answer_log_flushed();
     answer_net_left();
     finish_leave();                                  /* ends the leave */
     reset_down();
@@ -3973,6 +4297,7 @@ TEST_CASE("AO_Boot hears the home hold on the bus, not the ordinary hold",
 
     /* The grace runs out and the leave ends in the reset, which ends the case. */
     (void)qf_support_tick(AO_Boot, QF_SUPPORT_STEPS(KODE_SYS_HOME_GRACE_MS));
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
     answer_net_left();
     finish_leave();
@@ -4080,6 +4405,7 @@ TEST_CASE("a setting asked before a restart is written before the board leaves",
         "the leave has not begun");
 
     reset_pump();
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
     answer_net_left();
     TEST_ASSERT_EQUAL_INT((int)RADIO_PARK_REQ_SIG, mailbox_take(AO_Radio, NULL));
@@ -4123,6 +4449,7 @@ TEST_CASE("a setting asked while the board leaves is dropped", "[boot_ao][nvs]")
     fake_klog_reset();
     reset_pump();
 
+    answer_log_flushed();
     TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
     TEST_ASSERT_FALSE(store_holds("level", "7"));
     TEST_ASSERT_TRUE_MESSAGE(klog_has("already leaving; this setting is dropped"),

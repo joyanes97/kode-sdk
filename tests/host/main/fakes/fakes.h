@@ -730,6 +730,9 @@ unsigned fake_nvs_set_count(void);
  *         what another task would see while the store is being written. */
 void fake_nvs_set_hook(void (*hook)(void));
 
+/** @brief The key of the write a hook is run inside; "" outside one. */
+const char *fake_nvs_set_key(void);
+
 /** @brief How many lines reached the capture sink. */
 unsigned fake_klog_count(void);
 
@@ -823,6 +826,13 @@ void fake_ble_reset(void);
  *         kdrv_ble_addr() refuse, the way a controller that never answered
  *         the host would. */
 void fake_ble_set_sync(bool synced);
+
+/** @brief Lines kdrv_ble_console_write_confirmed() was given since boot. */
+unsigned fake_ble_console_confirmed(void);
+
+/** @brief Call the confirmation callback the console installed, as NimBLE's
+ *         host task would once the central answered (@p ok) or did not. */
+void fake_ble_console_answer(bool ok);
 
 /** @brief Make kdrv_ble_start() fail - a controller the C5 would not bring up. */
 void fake_ble_fail_start(bool fail);

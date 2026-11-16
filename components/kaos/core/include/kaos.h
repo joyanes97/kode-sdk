@@ -2520,7 +2520,13 @@ uint32_t console_rx_dropped(void);
  */
 bool console_congested(void);
 
-/** @brief Ask AO_Radio to publish BLE_STATE_SIG now. Always answered. */
+/**
+ * @brief Ask AO_Radio to publish BLE_STATE_SIG now.
+ *
+ * Posted with KQP_RADIO_POST_MARGIN, as AO_Radio's doors are. A queue too
+ * full for it drops the ask; the asker then hears the BLE state the next time
+ * it changes.
+ */
 void ble_state_request(void);
 
 /**
@@ -3015,12 +3021,14 @@ typedef enum {
 } chan_session_t;
 
 /**
- * @brief Ask AO_Net to publish CHANNEL_STATE_SIG now. Always answered, with
- *        CHAN_OFF in a firmware built without the channel.
+ * @brief Ask AO_Net to publish CHANNEL_STATE_SIG now, with CHAN_OFF in a
+ *        firmware built without the channel.
  *
- * A post like the other requests here: a full queue is a reset, not a false.
+ * Posted with KQP_NET_CMD_MARGIN, as AO_Net's other doors are. A queue too
+ * full for it refuses the ask; the asker then hears the channel's state the
+ * next time it changes.
  *
- * @return true; the form is the facade's, where a request can be refused.
+ * @return true when the ask was posted; false when the queue refused it.
  */
 bool channel_state_request(void);
 
@@ -4060,6 +4068,38 @@ bool appmgr_image_ask(uint8_t src_kind, const char *src, uint8_t dst_kind,
                       bool launch, QActive *who);
 
 /**
+ * @brief appmgr_image_ask() for a console command: the install's record names
+ *        the port it came on.
+ *
+ * @param src_kind kfw_src_t as a plain integer.
+ * @param src      File name for fs/sd, URL for http, ignored otherwise.
+ * @param dst_kind kfw_target_t as a plain integer.
+ * @param launch   Boot the image once it is written and verified.
+ * @param who      Where the verdict is posted.
+ * @param asker    KODE_CONSOLE_SRC_* of the command that asked: once the
+ *                 install is taken, its record (`>|install`) goes there, before
+ *                 the verdict and again when the install ends.
+ * @return false when the pool was dry and nothing was posted: no verdict
+ *         will come.
+ */
+bool appmgr_image_ask_from(uint8_t src_kind, const char *src, uint8_t dst_kind,
+                           bool launch, QActive *who, uint8_t asker);
+
+/**
+ * @brief Ask AO_AppMgr for the records of the last app install and the last
+ *        kodeOS update (`install_info`).
+ *
+ * AO_AppMgr writes the two `>|install` records to @p asker, then posts @p who
+ * one APP_REQ_RSP_SIG, always APP_REQ_TAKEN.
+ *
+ * @param who   Where the end is posted.
+ * @param asker KODE_CONSOLE_SRC_* of the command that asked.
+ * @return false when the pool was dry or AO_AppMgr's queue had no room past
+ *         KQP_APPMGR_CMD_MARGIN, and nothing was posted: no answer will come.
+ */
+bool appmgr_install_info_ask(QActive *who, uint8_t asker);
+
+/**
  * @brief appmgr_run_request(), asking AO_AppMgr for its verdict.
  *
  * AO_AppMgr posts @p who one APP_REQ_RSP_SIG: taken when an installed app has
@@ -4255,6 +4295,22 @@ typedef enum {
 
 /** @brief Why we booted, as AO_Boot worked it out on the way up. */
 kboot_reason_t boot_reason(void);
+
+/**
+ * @brief What became of the kodeOS slot that is not running, as AO_Boot read
+ *        otadata on the way up, before the rescue clears it
+ *        (BootStableEvt.other).
+ *
+ * Running from factory after the rescue took over, the other slot was
+ * launched whatever otadata says of it, so it never reads as never launched.
+ */
+typedef enum {
+    KBOOT_OTHER_NEVER_RAN,     /**< Never launched: no switch to it took effect. */
+    KBOOT_OTHER_UNCONFIRMED,   /**< Launched and never confirmed itself; the
+                                *   bootloader brought the board back.          */
+    KBOOT_OTHER_GIVEN_UP       /**< Launched, then given up on after it kept
+                                *   crashing.                                   */
+} kboot_other_t;
 
 /**
  * @brief How the app before this boot ended.
@@ -4466,6 +4522,12 @@ void boot_radio_parked(void);
 void boot_net_left(void);
 
 /**
+ * @brief Tell AO_Boot that AO_Log has written what was posted to it before
+ *        the leave. AO_Log's answer to log_flush_request(), exactly once.
+ */
+void boot_log_flushed(void);
+
+/**
  * @brief Whether a held bottom button is still waiting to reset the board,
  *        and a deferral would still be honoured.
  *
@@ -4535,6 +4597,20 @@ void log_level_request(const char *tag, kode_log_lvl_t level);
  *         was within KQP_CMD_MARGIN, or @p who was NULL.
  */
 bool log_dock_lend_request(QActive *who, bool lend);
+
+/**
+ * @brief Ask AO_Log to answer AO_Boot once the lines already posted to it are
+ *        written to their ports (LOG_FLUSH_REQ_SIG, boot_log_flushed()).
+ *
+ * The first step of a leave: a line handed to AO_Log before the jump (an
+ * install's last record) reaches the Kode channel's and the BLE console's
+ * rings before AO_Net and AO_Radio take those ports down. AO_Log writes, it
+ * waits for nothing.
+ *
+ * @return false when nothing was posted: AO_Log's queue was within
+ *         KQP_LOG_CMD_MARGIN.
+ */
+bool log_flush_request(void);
 
 /* ---- AO_Console: the command line ---------------------------------------
  * Owns no hardware. It receives whole lines from AO_Log, parses them

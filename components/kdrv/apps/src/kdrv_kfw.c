@@ -396,6 +396,8 @@ static struct {
     uint32_t                ad_fill;    /**< Block header or body bytes seen so far. */
     bool                    ad_skip;    /**< The block's bytes are stepped over, not kept. */
     bool                    ad_dropped; /**< A block was there and was not believed: not the same as none. */
+    bool                    foreign;    /**< The image was refused as another chip's or target's. */
+    bool                    malformed;  /**< The image was refused as not well formed. */
 } s_kfw;
 
 bool kfw_busy(void)
@@ -406,6 +408,16 @@ bool kfw_busy(void)
 uint32_t kfw_produced(void)
 {
     return s_kfw.produced;
+}
+
+bool kfw_foreign(void)
+{
+    return s_kfw.foreign;
+}
+
+bool kfw_malformed(void)
+{
+    return s_kfw.malformed;
 }
 
 /**
@@ -474,6 +486,7 @@ static kode_status_t emit(const uint8_t *data, size_t len)
          * best. Stop it before it runs past the sink's session, not after. */
         KLOG_E(TAG, "the payload produces more than the %u bytes it declared",
                (unsigned)s_kfw.hdr.image_len);
+        s_kfw.malformed = true;
         return KODE_ERROR;
     }
     if ( s_kfw.sha_open )
@@ -528,6 +541,7 @@ static kode_status_t inflate_feed(const uint8_t *in, size_t len)
         if ( (int)ts < 0 )
         {
             KLOG_E(TAG, "the deflate payload is corrupt (tinfl %d)", (int)ts);
+            s_kfw.malformed = true;
             return KODE_ERROR;
         }
         if ( (0U == len) && (0U == out_bytes) )
@@ -623,6 +637,7 @@ kode_status_t kfw_feed(const void *data, size_t len)
                         KLOG_E(TAG, "that image was built for chip id 0x%04x, "
                                     "not this target's 0x%04x", (unsigned)chip,
                                (unsigned)target_chip(s_kfw.want));
+                        s_kfw.foreign = true;
                         s_kfw.st = KFW_ST_DEAD;
                         return KODE_ERROR;
                     }
@@ -641,6 +656,7 @@ kode_status_t kfw_feed(const void *data, size_t len)
                         KLOG_E(TAG, "that image's first segment is %u bytes and "
                                     "the file holds %u: it was cut short",
                                (unsigned)seg0, (unsigned)s_kfw.src_len);
+                        s_kfw.malformed = true;
                         s_kfw.st = KFW_ST_DEAD;
                         return KODE_ERROR;
                     }
@@ -679,6 +695,7 @@ kode_status_t kfw_feed(const void *data, size_t len)
                     != KODE_OK )
                 {
                     KLOG_E(TAG, "this is neither a container nor an ESP image");
+                    s_kfw.malformed = true;
                     s_kfw.st = KFW_ST_DEAD;
                     return KODE_ERROR;
                 }
@@ -687,6 +704,7 @@ kode_status_t kfw_feed(const void *data, size_t len)
                     KLOG_E(TAG, "the container is for target %u, but %u was "
                                 "asked for", (unsigned)s_kfw.hdr.target,
                            (unsigned)s_kfw.want);
+                    s_kfw.foreign = true;
                     s_kfw.st = KFW_ST_DEAD;
                     return KODE_ERROR;
                 }
@@ -773,6 +791,7 @@ kode_status_t kfw_feed(const void *data, size_t len)
                      * followed any further. */
                     KLOG_E(TAG, "app data: %s - the payload cannot be found",
                            kfw_ad_status_name(KFW_AD_BAD_MAGIC));
+                    s_kfw.malformed = true;
                     s_kfw.st = KFW_ST_DEAD;
                     return KODE_ERROR;
                 }
