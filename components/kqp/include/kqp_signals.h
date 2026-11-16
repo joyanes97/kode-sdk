@@ -41,6 +41,11 @@ enum KodeSignals {
                                  *   place in the region (AppEvictedEvt), one
                                  *   event per app, before the write starts.
                                  *   The app it replaces is not one.          */
+    APP_CARD_FULL_SIG,          /**< AO_AppMgr: the copy of an app does not fit
+                                 *   the card, and that app has none. Published
+                                 *   once for each card mounted; bare and
+                                 *   static. The interface says the card is
+                                 *   full when it is in sight.                */
     RECV_READY_SIG,             /**< The console's receive protocol: sent by
                                  *   whichever AO is receiving, once its
                                  *   destination is open and the console is in
@@ -95,6 +100,11 @@ enum KodeSignals {
     RECV_FAIL_SIG,              /**< The receive protocol: refused, or the
                                  *   bytes did not survive the trip - kcli
                                  *   error 5.                                 */
+    RECV_AGAIN_SIG,             /**< The receive protocol: AO_AppMgr refused the
+                                 *   stream for now and nothing was armed - an
+                                 *   app the image would evict has no copy on
+                                 *   the card yet. Ask again: kcli error 4.
+                                 *   Bare and static, as the endings beside it. */
     RECV_STALL_SIG,             /**< The receive protocol: the host stopped
                                  *   sending and never came back - kcli
                                  *   error 6.                                 */
@@ -354,6 +364,8 @@ enum KodeSignals {
     STORAGE_INFO_SIG,           /**< AO_Storage: one medium's mount state and
                                  *   usage, in answer to STORAGE_OP_INFO
                                  *   (StorageInfoEvt).                        */
+    STORAGE_CARD_SIG,           /**< AO_Storage: the card was mounted, or is
+                                 *   mounted no more (StorageCardEvt).        */
     STORAGE_TEST_SIG,           /**< AO_Storage: one phase of the card test
                                  *   (StorageTestEvt) - what it did and what
                                  *   it measured. The console prints it.      */
@@ -584,6 +596,9 @@ enum KodeSignals {
                                  *   three owns the transfer.                 */
     APP_RECV_IDLE_SIG,          /**< AO_AppMgr private QTimeEvt: no chunk for
                                  *   KODE_RECV_IDLE_MS - the host is gone.    */
+    APP_BACKUP_TMO_SIG,         /**< AO_AppMgr private QTimeEvt, one-shot: the
+                                 *   wait, the pace or the deadline of the
+                                 *   copy to the card in hand.                */
     APP_RECV_LAUNCH_SIG,        /**< AO_AppMgr private QTimeEvt: the drain
                                  *   delay after a successful install is
                                  *   over - boot it (AppMgr_launching).       */
@@ -633,6 +648,8 @@ enum KodeSignals {
     STORAGE_WRITE_NEXT_SIG,     /**< AO_Storage private self-post: the next
                                  *   chunk of the write in progress.         */
     STORAGE_WRITE_RSP_SIG,      /**< To the writer (StorageWriteRspEvt).      */
+    STORAGE_WRITE_ABANDON_REQ_SIG, /**< AO_Storage: the writer ends its write
+                                 *   in flight (StorageWriteAbandonEvt).      */
     STORAGE_DESC_REQ_SIG,       /**< AO_Storage: read the manifest out of the
                                  *   front of one file (StorageDescReqEvt).
                                  *   Posted directly, never published: the
@@ -784,6 +801,9 @@ enum KodeSignals {
                                  *   STORAGE_CAT_LINES_PER_STEP per step, for
                                  *   the same reason STORAGE_WRITE_NEXT_SIG
                                  *   exists.                                  */
+    STORAGE_SWEEP_NEXT_SIG,     /**< AO_Storage private QTimeEvt: the next
+                                 *   pass over the card's root for what a cut
+                                 *   copy of an app left there.               */
     STORAGE_COPY_NEXT_SIG,      /**< AO_Storage private QTimeEvt: the next
                                  *   chunk of the `cp` in progress. One 32 KB
                                  *   chunk per step, for the same reason
@@ -1842,7 +1862,7 @@ enum KodeSignals {
                                  *   scheduler's `mqtt` entry falls due
                                  *   (NetCheckAtEvt).                         */
     NET_CHECK_TMO_SIG,          /**< AO_Net private QTimeEvt, one-shot: the
-                                 *   dwell of a radio wake for that check has
+                                 *   dwell of a dark wake for that check has
                                  *   run out.                                 */
     NET_JOB_FAST_SIG,           /**< AO_Net private QTimeEvt, one-shot: no job
                                  *   with either worker for NET_FAST_JOB_HOLD_MS,
@@ -1999,12 +2019,12 @@ enum KodeSignals {
                                  *   lowpower_wake_at()): an owner has work
                                  *   due at a real time; asleep, the board
                                  *   wakes for it (LowPowerWakeAtEvt).      */
-    LOWPOWER_RADIO_DONE_SIG,    /**< AO_LowPower (direct post, from
-                                 *   lowpower_radio_done()): a radio owner's
-                                 *   work in a radio wake is finished
-                                 *   (LowPowerRadioDoneEvt).                */
-    LOWPOWER_RADIO_TMO_SIG,     /**< AO_LowPower private QTimeEvt, one-shot:
-                                 *   a radio wake ran KODE_LOWPOWER_RADIO_MAX_MS. */
+    LOWPOWER_DARK_DONE_SIG,     /**< AO_LowPower (direct post, from
+                                 *   lowpower_dark_done()): a dark-wake owner's
+                                 *   work in a dark wake is finished
+                                 *   (LowPowerDarkDoneEvt).                */
+    LOWPOWER_DARK_TMO_SIG,      /**< AO_LowPower private QTimeEvt, one-shot:
+                                 *   a dark wake ran KODE_LOWPOWER_DARK_MAX_MS. */
     LOWPOWER_RETRY_TMO_SIG,     /**< AO_LowPower private QTimeEvt, one-shot:
                                  *   begin a requested round again, an owner
                                  *   having been busy or silent in the last
@@ -2309,8 +2329,8 @@ typedef struct {
 /** @brief Why a write failed, as far as the glass needs to know. */
 typedef enum {
     KFAIL_WRITE = 0,  /**< The write itself: the image, the medium, the flash. */
-    KFAIL_KEEP,       /**< Nothing was written: the card could not keep an app
-                       *   this install would have removed.                  */
+    KFAIL_BUSY,       /**< Nothing was written: an app this install would
+                       *   remove has no copy on the card yet. Ask again.     */
 } kfail_t;
 
 /**
@@ -2349,7 +2369,8 @@ typedef struct {
 /** @brief What AO_AppMgr made of a request that asked for a verdict (AppReqRspEvt.verdict). */
 typedef enum {
     APP_REQ_TAKEN = 0,   /**< Taken: the install is under way, or the app is on its way to boot. */
-    APP_REQ_BUSY,        /**< AO_AppMgr has work in hand: ask again.                           */
+    APP_REQ_BUSY,        /**< AO_AppMgr has work in hand, or an app the install would evict
+                          *   has no copy on the card yet: ask again.                          */
     APP_REQ_MISSING,     /**< The file is not on the medium, or the app is not installed.      */
     APP_REQ_EMPTY,       /**< The mailbox holds nothing to install.                            */
     APP_REQ_REFUSED      /**< Refused for another reason, which the log gives.                 */
@@ -2765,15 +2786,37 @@ typedef struct {
     const void *data;
     uint32_t    len;
     QActive    *who;    /**< Where the response goes.                         */
+    uint32_t    tag;    /**< The writer's own number for this write, given back
+                         *   in the answer; KODE_STORAGE_TAG_NONE when one write
+                         *   at a time is all the writer has. */
+    bool        yields; /**< The write gives way to a download: refused while
+                         *   one runs, and cut between two chunks when one is
+                         *   asked for. Set by storage_write_yield_request(). */
 } StorageWriteEvt;
 
 /** @brief How a write ended (STORAGE_WRITE_RSP_SIG). */
 typedef struct {
     QEvt     super;
     uint32_t written;
-    uint8_t  status;    /**< kode_status_t                                    */
+    uint8_t  status;    /**< kode_status_t. Before the file is opened:
+                         *   KODE_NO_RESOURCES for a path whose volume has
+                         *   less room than the file is long, KODE_ERROR for a
+                         *   write that gives way on a card that has not
+                         *   proved it takes a write, KODE_DENIED for any
+                         *   other refusal. After: KODE_DENIED for a write
+                         *   that gave way to a download, KODE_NO_RESOURCES
+                         *   for one that gives way and found the card full,
+                         *   else how the medium failed. */
     uint8_t  medium;    /**< Where it landed.                                 */
+    uint32_t tag;       /**< The request's tag: a late answer to a write given
+                         *   up on is told from the answer to the write in hand. */
 } StorageWriteRspEvt;
+
+/** @brief The writer gives up its write in flight (STORAGE_WRITE_ABANDON_REQ_SIG). */
+typedef struct {
+    QEvt     super;
+    QActive *who;       /**< The AO that asked for the write; no other can end it. */
+} StorageWriteAbandonEvt;
 
 /**
  * @brief Ask what one file says it is (STORAGE_DESC_REQ_SIG).
@@ -2795,6 +2838,7 @@ typedef struct {
     char    project[32];                         /**< esp_app_desc_t.project_name. */
     char    display[KODE_APP_DISPLAY_MAX];       /**< Empty when unmanifested.   */
     char    category[KODE_APP_CATEGORY_MAX];     /**< Empty when none is named.  */
+    uint8_t build[KODE_APP_BUILD_LEN];           /**< The image's build id; zero when it has none. */
     uint8_t status;                              /**< kode_status_t of the read. */
 } StorageDescRspEvt;
 
@@ -6798,6 +6842,18 @@ typedef struct {
 } StorageInfoEvt;
 
 /**
+ * @brief The card's mount changed (STORAGE_CARD_SIG).
+ *
+ * Published when a card is mounted, the same one again or another, and when
+ * the mounted card is mounted no more. What was known of its files is to be
+ * asked again.
+ */
+typedef struct {
+    QEvt super;
+    bool mounted;           /**< A card is mounted now.                      */
+} StorageCardEvt;
+
+/**
  * @brief Read, write or dump one field of the card (STORAGE_FIELD_REQ_SIG).
  *
  * The field is kdrv_sd_field_t, already resolved from its name by whoever
@@ -7303,8 +7359,8 @@ typedef enum {
     KODE_LP_AWAKE = 0,   /**< Everything runs; the CPU holds its lock.       */
     KODE_LP_ASLEEP,      /**< Light sleep whenever every task is idle.       */
     KODE_LP_OFF,         /**< Deep sleep; the pins held at rest.             */
-    KODE_LP_RADIO        /**< A radio wake inside ASLEEP: the tick runs and the
-                          *   lock is held for the radio owners alone, and the
+    KODE_LP_DARK         /**< A dark wake inside ASLEEP: the tick runs and the
+                          *   lock is held for the dark-wake owners alone, and the
                           *   glass stays asleep. Published as a state, never
                           *   a target, and never what the board is said to be
                           *   in (lowpower_info says asleep).                 */
@@ -7643,12 +7699,12 @@ typedef struct {
  * and began from ASLEEP), for owners that had already rested. state ASLEEP is
  * published before the QP tick stops, so nobody may arm a QTimeEvt on it.
  *
- * state RADIO says an owner's work fell due while ASLEEP and that the radio
+ * state DARK says an owner's work fell due while ASLEEP and that the dark-wake
  * owners alone are to do it: the tick runs and the lock is held, but the
  * glass and the other devices stay at rest. Only the owners that joined with
- * lowpower_join_radio() act on it (they restore as for AWAKE); everyone else
+ * lowpower_join_dark() act on it (they restore as for AWAKE); everyone else
  * ignores any state that is not AWAKE. The wake ends with state ASLEEP and
- * prev RADIO, or with AWAKE when something real used the board.
+ * prev DARK, or with AWAKE when something real used the board.
  */
 typedef struct {
     QEvt    super;
@@ -7691,11 +7747,11 @@ typedef struct {
     uint8_t  who;      /**< The id lowpower_join() gave the owner, for the log. */
 } LowPowerWakeAtEvt;
 
-/** @brief A radio owner's work in a radio wake is finished (LOWPOWER_RADIO_DONE_SIG). */
+/** @brief A dark-wake owner's work in a dark wake is finished (LOWPOWER_DARK_DONE_SIG). */
 typedef struct {
     QEvt    super;
-    uint8_t who;       /**< The id lowpower_join_radio() gave the owner.     */
-} LowPowerRadioDoneEvt;
+    uint8_t who;       /**< The id lowpower_join_dark() gave the owner.     */
+} LowPowerDarkDoneEvt;
 
 /** @brief A request to go to a state (LOWPOWER_REQ_SIG). */
 typedef struct {

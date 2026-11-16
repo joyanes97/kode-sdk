@@ -87,7 +87,8 @@ KAOS_WEAK void storage_open_request(const char *name, QActive *who);
 KAOS_WEAK void storage_path_request(QActive *who, uint8_t op, const char *path);
 KAOS_WEAK void storage_read_request(void);
 KAOS_WEAK void storage_write_all_request(const char *name, const void *data,
-                                         uint32_t len, QActive *who);
+                                         uint32_t len, QActive *who,
+                                         uint32_t tag);
 KAOS_WEAK bool appmgr_image_ask_from(uint8_t src_kind, const char *src,
                                      uint8_t dst_kind, bool launch,
                                      QActive *who, uint8_t asker);
@@ -6961,6 +6962,7 @@ static QState Console_initial(Console * const me, void const * const par)
     QActive_subscribe(&me->super, RECV_DONE_SIG);
     QActive_subscribe(&me->super, APP_EVICTED_SIG);
     QActive_subscribe(&me->super, RECV_FAIL_SIG);
+    QActive_subscribe(&me->super, RECV_AGAIN_SIG);
     QActive_subscribe(&me->super, RECV_STALL_SIG);
     QActive_subscribe(&me->super, APP_CAT_RSP_SIG);
     QActive_subscribe(&me->super, APP_ERASE_DONE_SIG);
@@ -8187,9 +8189,11 @@ static QState console_own(Console * const me, QEvt const * const e)
             status = Q_HANDLED();
             break;
         }
+        case RECV_AGAIN_SIG:
         case RECV_BUSY_SIG: {
             /* AO_Storage's transfer in flight outlasted the wait of this
-             * `file_put`: nothing was armed, the host sends no byte. */
+             * `file_put`, or AO_AppMgr refused this install for now:
+             * nothing was armed, the host sends no byte. */
             if ( (uint8_t)KCLI_RECV == me->inflight )
             {
                 console_reply_err(KCLI_ERR_BUSY, "busy");
@@ -8240,7 +8244,8 @@ static QState console_own(Console * const me, QEvt const * const e)
                     if ( to_file )
                     {
                         storage_write_all_request(me->file_name, img, r->len,
-                                                  &me->super);
+                                                  &me->super,
+                                                  KODE_STORAGE_TAG_NONE);
                     }
                     else
                     {

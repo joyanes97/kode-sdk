@@ -93,13 +93,15 @@ typedef struct {
  *                    before any other app: its old copy would otherwise cost
  *                    every older app its place, and the install replaces it
  *                    anyway.
+ * @param copied      Bit n: entry n has its copy on the card. Those apps are
+ *                    evicted first, oldest first; the others only after them.
  * @param out         The plan.
  * @return KODE_OK, or KODE_ERROR when the image cannot fit even in an empty
  *         region (nothing is planned then).
  */
 kode_status_t kdrv_apps_plan(const kapps_dir_t *d, uint32_t region_size,
                              uint32_t img_size, uint8_t replacing,
-                             kapps_plan_t *out);
+                             uint64_t copied, kapps_plan_t *out);
 
 /* ---- Writing an image into the region -------------------------------------- */
 
@@ -188,6 +190,15 @@ const kfw_sink_t *kdrv_apps_sink(void);
  */
 kode_status_t kdrv_apps_desc(const kapps_entry_t *e, kdrv_slot_desc_t *out,
                              kapp_desc_t *manifest);
+
+/**
+ * @brief Read an installed app's build id out of its image header.
+ * @param e   The directory entry naming the image.
+ * @param out KAPP_BUILD_LEN bytes; zeroed when the image has no descriptor.
+ * @return KODE_OK; KODE_DENIED before init or for a NULL argument; KODE_ERROR
+ *         when the extent cannot be read or holds no descriptor.
+ */
+kode_status_t kdrv_apps_build_id(const kapps_entry_t *e, uint8_t *out);
 
 /**
  * @brief Verify the image found at @p offset within @p size bytes.
