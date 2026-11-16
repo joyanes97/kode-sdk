@@ -43,6 +43,20 @@ extern "C" {
  */
 void kode_block_delay_ms(uint32_t ms);
 
+/* ---- The screen: AO_Display's answers to kode_sys_screen_sleep() ---- */
+
+/**
+ * @brief How many requests to sleep or wake the display AO_Display has answered, and how the last one ended.
+ * @note Never blocks: a task, which hears no DISPLAY_SLEEP_SIG, waits for its
+ *       request by watching the count change.
+ * @param[out] rc  The last answer's status: KODE_OK when the glass was as that
+ *                 request asked. NULL when not wanted.
+ * @param[out] why Why not, in words, or "" for KODE_OK; a string owned by
+ *                 the system. NULL when not wanted.
+ * @return The count since the boot; it wraps at 65536.
+ */
+uint16_t kode_block_screen_sleep_answers(kode_status_t *rc, const char **why);
+
 /* ---- Infrared: through AO_Ir; without KODEOS_RADIO (the block is on the C5) the calls refuse ---- */
 
 /**
@@ -140,6 +154,9 @@ kode_status_t kode_block_audio_record_file(const char *path, uint32_t ms,
 /**
  * @brief Open the stream and wait until it is playing.
  * @note Blocks. Every other sound and a second stream are refused meanwhile.
+ * @note AO_Audio closes it after KODE_SYS_AUDIO_STREAM_IDLE_MS without a write;
+ *       its writes are KODE_DENIED from then on, and the next call that wants
+ *       the audio path has it.
  * @note One task at a time; the opener may hand the stream over before it writes.
  * @param rate_hz  KODE_SYS_AUDIO_RATE_HZ; any other rate is refused.
  * @param channels KODE_SYS_AUDIO_CHANNELS_MONO, or _STEREO for left-right pairs played as their mean.
@@ -158,7 +175,8 @@ kode_status_t kode_block_audio_stream_open(uint32_t rate_hz, uint8_t channels);
  * @param ms     The longest to wait for room in all; 0 takes what fits and returns.
  * @param taken  Out: how many frames went in; may be NULL.
  * @return KODE_OK when all @p n went in. KODE_TIMEOUT when @p ms ran out first
- *         (@p taken says how far). KODE_DENIED when no stream is open.
+ *         (@p taken says how far). KODE_DENIED when no stream is open, or the
+ *         one this call's opener opened has been closed for silence.
  */
 kode_status_t kode_block_audio_stream_write(const int16_t *frames, size_t n,
                                             uint32_t ms, size_t *taken);
@@ -170,6 +188,15 @@ kode_status_t kode_block_audio_stream_write(const int16_t *frames, size_t n,
  *         open; KODE_TIMEOUT when AO_Audio never answered.
  */
 kode_status_t kode_block_audio_stream_close(void);
+
+/**
+ * @brief Whether the stream kode_block_audio_stream_open() opened still takes writes.
+ * @note Never blocks. False once AO_Audio closed it for
+ *       KODE_SYS_AUDIO_STREAM_IDLE_MS without a write, though nobody called
+ *       kode_block_audio_stream_close().
+ * @return true from the open's KODE_OK until its close or AO_Audio's.
+ */
+bool kode_block_audio_stream_is_open(void);
 
 /* ---- Motion: AO_Haptic drives the LRA, AO_Imu reads the QMI8658A and QMC5883P ---- */
 
@@ -562,6 +589,21 @@ kode_status_t kode_block_net_ping(const char *host, uint8_t count,
  */
 kode_status_t kode_block_http_get_buffer(const char *url, void *buf, uint32_t cap,
                                          kode_sys_http_result_t *out);
+
+/**
+ * @brief GET the @p cap bytes of @p url from @p offset on, in the caller's task.
+ * @note Blocks, as kode_block_http_get_buffer(). The status says where the
+ *       bytes start (206: at @p offset; 200: at 0, cut at @p cap; 416: nowhere),
+ *       and @c range_total the length of the whole, -1 when the server sent none.
+ * @param url    The address.
+ * @param offset The first byte wanted.
+ * @param buf    Where the bytes go.
+ * @param cap    Its room, above 0.
+ * @param out    Out: status, lengths and the total; required.
+ * @return KODE_OK, KODE_TIMEOUT or KODE_ERROR; KODE_DENIED without CONFIG_KODEOS_NET.
+ */
+kode_status_t kode_block_http_get_range(const char *url, uint64_t offset, void *buf,
+                                        uint32_t cap, kode_sys_http_result_t *out);
 
 /**
  * @brief POST @p body to @p url and read the answer into @p buf.

@@ -1429,8 +1429,17 @@ TEST_CASE("the build really has the home hold compiled in", "[boot_ao]")
     TEST_PASS();
 }
 
-/** @brief The bottom button held, exactly as AO_Buttons publishes it. */
+/** @brief The bottom button held to the home hold, exactly as AO_Buttons publishes it. */
 static void hold_bot(void)
+{
+    ButtonHoldEvt h;
+    h.super = (QEvt)QEVT_INITIALIZER(BUTTON_HOME_HOLD_SIG);
+    h.id    = (uint8_t)KDRV_BTN_BOT;
+    QASM_DISPATCH(AO_Boot, &h.super, 0U);
+}
+
+/** @brief The bottom button's ordinary hold, the one an app keeps for itself. */
+static void hold_bot_short(void)
 {
     ButtonHoldEvt h;
     h.super = (QEvt)QEVT_INITIALIZER(BUTTON_HOLD_SIG);
@@ -1491,6 +1500,33 @@ TEST_CASE("a held bottom button announces home and leaves after the grace",
     answer_net_left();
     finish_leave();
     TEST_ASSERT_EQUAL_UINT(1U, fake_system_restarts());
+
+    ao_spy_drain();
+    Mockkdrv_slot_Verify();
+    Mockkdrv_slot_Destroy();
+}
+
+/* Home is the long hold. The ordinary one, KODE_BUTTON_HOLD_MS into the same
+ * press, is the app's own to use: it announces nothing and arms no grace. */
+TEST_CASE("the bottom button's ordinary hold is not home in an app", "[boot_ao]")
+{
+    Mockkdrv_slot_Init();
+    boot_fresh();
+    ao_spy_drain();
+    ao_spy_subscribe(HOME_SIG);
+
+    hold_bot_short();
+
+    for ( const QEvt *e = ao_spy_take(); NULL != e; e = ao_spy_take() )
+    {
+        TEST_ASSERT_NOT_EQUAL_MESSAGE(HOME_SIG, e->sig,
+                                      "the ordinary hold announces no home");
+    }
+    TEST_ASSERT_FALSE_MESSAGE(boot_home_pending(), "and arms no grace");
+    (void)qf_support_tick(AO_Boot, QF_SUPPORT_STEPS(KODE_SYS_HOME_DEFER_MAX_MS));
+    TEST_ASSERT_EQUAL_UINT(0U, fake_system_restarts());
+    TEST_ASSERT_EQUAL_INT_MESSAGE(-1, mailbox_take(AO_Net, NULL),
+        "nothing began to leave");
 
     ao_spy_drain();
     Mockkdrv_slot_Verify();
@@ -3031,6 +3067,11 @@ TEST_CASE("a button hold during a reset is dropped at debug level",
     hold_bot();
     TEST_ASSERT_TRUE_MESSAGE(klog_has("this button hold is dropped"),
         "at debug");
+    /* kodeOS, built without the home hold, hears the ordinary one: the same. */
+    fake_klog_reset();
+    hold_bot_short();
+    TEST_ASSERT_TRUE_MESSAGE(klog_has("this button hold is dropped"),
+        "the ordinary hold too");
     TEST_ASSERT_EQUAL_INT(-1, mailbox_sig(AO_Radio));
 
     answer_find(false, 0U, 0U, false, true);      /* ends the case */
@@ -3600,5 +3641,221 @@ TEST_CASE("a reset with no asker or no end is not posted", "[boot_ao][reset]")
     reset_pump();
     TEST_ASSERT_EQUAL_INT(0, (int)ao_spy_count());
     TEST_ASSERT_EQUAL_INT(-1, mailbox_sig(AO_AppMgr));
+    reset_down();
+}
+
+/* ---- The home hold, as it arrives on the bus --------------------------------- */
+
+/* What AO_Buttons publishes is what AO_Boot must hear: the home hold reaches
+ * its queue, and the ordinary hold of the same press does not. */
+TEST_CASE("AO_Boot hears the home hold on the bus, not the ordinary hold",
+          "[boot_ao]")
+{
+    static const ButtonHoldEvt far = { .super = QEVT_INITIALIZER(BUTTON_HOME_HOLD_SIG),
+                                       .id    = (uint8_t)KDRV_BTN_BOT };
+    static const ButtonHoldEvt near = { .super = QEVT_INITIALIZER(BUTTON_HOLD_SIG),
+                                        .id    = (uint8_t)KDRV_BTN_BOT };
+    const QEvt *e;
+
+    Mockkdrv_slot_Init();
+    boot_fresh();
+    queue_drained(AO_Boot);
+
+    QACTIVE_PUBLISH(&near.super, NULL);
+    TEST_ASSERT_NULL_MESSAGE(mailbox_event(AO_Boot),
+        "the ordinary hold is not AO_Boot's in an app");
+
+    QACTIVE_PUBLISH(&far.super, NULL);
+    e = mailbox_event(AO_Boot);
+    TEST_ASSERT_NOT_NULL_MESSAGE(e, "the home hold reaches AO_Boot");
+    TEST_ASSERT_EQUAL_INT((int)BUTTON_HOME_HOLD_SIG, (int)e->sig);
+    QASM_DISPATCH(AO_Boot, e, 0U);
+    QF_gc(e);
+    TEST_ASSERT_TRUE_MESSAGE(boot_home_pending(), "and it arms the grace");
+
+    /* The grace runs out and the leave ends in the reset, which ends the case. */
+    (void)qf_support_tick(AO_Boot, QF_SUPPORT_STEPS(KODE_SYS_HOME_GRACE_MS));
+    TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
+    answer_net_left();
+    finish_leave();
+    TEST_ASSERT_EQUAL_UINT(1U, fake_system_restarts());
+
+    ao_spy_drain();
+    Mockkdrv_slot_Verify();
+    Mockkdrv_slot_Destroy();
+}
+
+/* ---- The app's store, written for an Active Object -------------------------
+ *
+ * An Active Object's step may not wait on flash, so kode_sys_nvs_set() posts
+ * the pair to AO_Boot, which writes it from its own thread. Every case goes
+ * through that door and lets AO_Boot read its queue in the order the board
+ * would.
+ */
+
+/** @brief Whether the app's store holds @p value under @p key. */
+static bool store_holds(const char *key, const char *value)
+{
+    char out[KODE_SYS_NVS_VALUE_MAX];
+
+    return (khal_nvs_get_str(KODE_NVS_NAMESPACE, key, out, sizeof(out)) == KODE_OK)
+           && (strcmp(out, value) == 0);
+}
+
+/** @brief AO_Boot up on a power-on, an empty store and a queue a margin post reads. */
+static void store_up(void)
+{
+    fake_nvs_reset();
+    Mockkdrv_slot_Init();
+    boot_fresh();
+    qf_support_margin_queue(AO_Boot);
+}
+
+/** @brief The end of a case store_up() began. */
+static void store_down(void)
+{
+    Mockkdrv_slot_Verify();
+    Mockkdrv_slot_Destroy();
+}
+
+TEST_CASE("a setting an Active Object asks for is written by AO_Boot",
+          "[boot_ao][nvs]")
+{
+    char out[KODE_SYS_NVS_VALUE_MAX];
+
+    store_up();
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_nvs_set("netid", "dot-07"));
+    TEST_ASSERT_FALSE_MESSAGE(store_holds("netid", "dot-07"),
+        "the asker's thread writes nothing");
+
+    reset_pump();
+    TEST_ASSERT_TRUE(store_holds("netid", "dot-07"));
+    TEST_ASSERT_EQUAL_INT_MESSAGE(KODE_OK,
+        kode_sys_nvs_get("netid", out, sizeof(out)),
+        "and the read of the same header finds it");
+    TEST_ASSERT_EQUAL_STRING("dot-07", out);
+
+    store_down();
+}
+
+/* The pair is copied when it is asked: the asker's buffers are its own again
+ * the moment the call returns. */
+TEST_CASE("a setting is stored as it was when it was asked", "[boot_ao][nvs]")
+{
+    char key[KODE_SYS_NVS_KEY_MAX]     = "level";
+    char value[KODE_SYS_NVS_VALUE_MAX] = "7";
+
+    store_up();
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_nvs_set(key, value));
+    (void)snprintf(key, sizeof(key), "other");
+    (void)snprintf(value, sizeof(value), "changed");
+
+    reset_pump();
+    TEST_ASSERT_TRUE(store_holds("level", "7"));
+    TEST_ASSERT_FALSE(store_holds("other", "changed"));
+
+    store_down();
+}
+
+/* An app that saves and then goes home: the two requests share AO_Boot's
+ * queue, so the write is done before the leave begins. */
+TEST_CASE("a setting asked before a restart is written before the board leaves",
+          "[boot_ao][nvs]")
+{
+    const QEvt *e;
+
+    store_up();
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_nvs_set("level", "7"));
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_exit_to_os());
+
+    e = mailbox_event(AO_Boot);
+    TEST_ASSERT_NOT_NULL(e);
+    TEST_ASSERT_EQUAL_INT_MESSAGE((int)BOOT_NVS_SET_SIG, (int)e->sig,
+        "the setting is first in the queue");
+    QASM_DISPATCH(AO_Boot, e, 0U);
+    QF_gc(e);
+    TEST_ASSERT_TRUE(store_holds("level", "7"));
+    TEST_ASSERT_EQUAL_INT_MESSAGE(-1, mailbox_take(AO_Net, NULL),
+        "the leave has not begun");
+
+    reset_pump();
+    TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
+    answer_net_left();
+    TEST_ASSERT_EQUAL_INT((int)RADIO_PARK_REQ_SIG, mailbox_take(AO_Radio, NULL));
+    finish_leave();
+    TEST_ASSERT_EQUAL_UINT(1U, fake_system_restarts());
+    TEST_ASSERT_TRUE(store_holds("level", "7"));
+
+    store_down();
+}
+
+/* The asker has gone on by the time the store answers, so a refusal is a
+ * warning in the log and nothing else: the next setting is written. */
+TEST_CASE("a setting the store refuses leaves a warning and the next is written",
+          "[boot_ao][nvs]")
+{
+    store_up();
+    fake_klog_reset();
+    fake_nvs_fail_next_set();
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_nvs_set("netid", "first"));
+    reset_pump();
+    TEST_ASSERT_FALSE(store_holds("netid", "first"));
+    TEST_ASSERT_TRUE_MESSAGE(klog_has("the store refused 'netid'"),
+        "the refusal names the key");
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_nvs_set("netid", "second"));
+    reset_pump();
+    TEST_ASSERT_TRUE(store_holds("netid", "second"));
+
+    store_down();
+}
+
+/* A board on its way out writes nothing more: the setting that arrives behind
+ * the restart request is dropped, and said. */
+TEST_CASE("a setting asked while the board leaves is dropped", "[boot_ao][nvs]")
+{
+    store_up();
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_exit_to_os());
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_nvs_set("level", "7"));
+    fake_klog_reset();
+    reset_pump();
+
+    TEST_ASSERT_EQUAL_INT((int)NET_LEAVE_REQ_SIG, mailbox_take(AO_Net, NULL));
+    TEST_ASSERT_FALSE(store_holds("level", "7"));
+    TEST_ASSERT_TRUE_MESSAGE(klog_has("already leaving; this setting is dropped"),
+        "a dropped setting says so");
+
+    answer_net_left();
+    TEST_ASSERT_EQUAL_INT((int)RADIO_PARK_REQ_SIG, mailbox_take(AO_Radio, NULL));
+    finish_leave();
+    TEST_ASSERT_FALSE(store_holds("level", "7"));
+
+    store_down();
+}
+
+/* A reset is erasing what the board remembers: a setting written in the middle
+ * would be the one thing it kept. */
+TEST_CASE("a setting asked during a factory reset is dropped", "[boot_ao][reset][nvs]")
+{
+    fake_nvs_reset();
+    reset_up();
+    qf_support_margin_queue(AO_Boot);
+    reset_ask(KBOOT_RESET_RESTART);
+    expect_find_asked();
+    fake_klog_reset();
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_nvs_set("level", "7"));
+    reset_pump();
+    TEST_ASSERT_FALSE(store_holds("level", "7"));
+    TEST_ASSERT_TRUE_MESSAGE(klog_has("busy with a factory reset; this setting is dropped"),
+        "a dropped setting says so");
+
+    answer_find(false, 0U, 0U, false, true);      /* ends the case */
+    expect_reply(KBOOT_RESET_STEP_FIND, KODE_NO_RESOURCES);
     reset_down();
 }

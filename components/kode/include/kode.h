@@ -15,6 +15,7 @@
 #include "kode_colors.h"
 #include "kode_defs.h"
 #include "kode_init.h"
+#include "kode_http_off.h"   /* kode_http_off_t, KODE_HTTP_OFF_MAX */
 #include "kapp_desc.h"
 
 #ifdef __cplusplus
@@ -809,20 +810,24 @@ bool kode_haptic_add_profile(const char *name, const uint16_t *pattern_ms, uint3
 
 /* ---- Audio ---- */
 
-/* 48 kHz, 16-bit, mono WAV or samples only. Audio calls take turns, and a play or a
+/* 48 kHz, 16-bit, mono WAV or samples only; a stream may also be written as
+ * left-right pairs. Audio calls take turns, and a play or a
  * recording to a file or a buffer keeps its turn to the end. A call that finds the speaker
  * or microphone held waits up to KODE_AUDIO_BUSY_MS, then fails with "audio is
  * busy"; a background recording waits the same, then ends with no frames.
- * kode_audio_set(), kode_audio_get(), kode_audio_play_stop(), kode_audio_is_playing()
- * and kode_audio_record_status() take no turn. A setting lasts this boot. A
- * sound is refused while a recording runs, and a recording while a sound
- * plays in the background. */
+ * kode_audio_set(), kode_audio_get(), kode_audio_play_stop(), kode_audio_is_playing(),
+ * kode_audio_record_status() and kode_audio_stream_write() take no turn. A
+ * setting lasts this boot. A sound is refused while a recording runs, and a
+ * recording while a sound plays in the background. The stream
+ * (kode_audio_stream_open()) is opened and closed apart from its writes, and
+ * while it is open every other sound and recording is refused at once. */
 
 #define KODE_AUDIO_BUSY_MS       5000U   /**< How long a call waits for the audio path.  */
 #define KODE_AUDIO_TONE_MAX_MS   65535U  /**< The longest tone, ms.                      */
 #define KODE_AUDIO_TONE_HZ_MIN   400U    /**< The lowest tone, Hz.                       */
 #define KODE_AUDIO_TONE_HZ_MAX   3400U   /**< The highest tone, Hz.                      */
 #define KODE_AUDIO_RECORD_MAX_MS 30000U  /**< The longest recording, ms.                 */
+#define KODE_AUDIO_STREAM_IDLE_MS 10000U /**< A stream left this long without a write is closed. */
 
 /** @brief What a recording in the background has done. */
 typedef struct {
@@ -881,6 +886,54 @@ bool kode_audio_play_stop(void);
  * @return true when they were heard or kode_audio_play_stop() ended them; false with kode_error() saying why.
  */
 bool kode_audio_play_samples(const int16_t *samples, uint32_t count);
+
+/**
+ * @brief Open the speaker for sound written a piece at a time.
+ *
+ * Blocks until the speaker plays. Waits its turn for it like
+ * kode_audio_play(); refused at once while a sound plays in the background, a
+ * recording runs or the stream is open already. The app has one stream. While
+ * it is open the speaker is its alone: every other sound and recording is
+ * refused at once with "audio is busy: a stream is open". Left
+ * KODE_AUDIO_STREAM_IDLE_MS without a write that put frames in, counted from
+ * the open while there has been none, the stream is closed for the app: the
+ * next write says so, and the other calls have the speaker again.
+ *
+ * @param channels 1 for mono samples, 2 for left-right pairs, played as their mean.
+ * @return true when the stream is open; false with kode_error() saying why.
+ */
+bool kode_audio_stream_open(uint8_t channels);
+
+/**
+ * @brief Write frames to the stream kode_audio_stream_open() opened.
+ *
+ * Blocks only while the stream is full, @p ms at most; it holds
+ * 200 ms of sound. Takes no turn, so the settings and the other calls are not
+ * kept waiting behind a writer. One task writes at a time. Like every call of
+ * this layer it is for tasks, never for an Active Object.
+ *
+ * @param frames 48 kHz 16-bit frames of the kind the stream was opened with; read in place until the call returns.
+ * @param count  How many frames, above 0: samples for mono, pairs for two channels.
+ * @param ms     The longest to wait for room in all; 0 takes what fits and returns.
+ * @param taken  Out, may be NULL: the frames that went in, also on failure.
+ * @return true when all @p count went in. false with kode_error() saying why:
+ *         the stream is full (@p taken says how far it got, and the stream
+ *         stays open), no stream is open, or it was closed for silence. A
+ *         write in the instant the stream closes for silence may still be
+ *         true, its frames unheard; the next write says so.
+ */
+bool kode_audio_stream_write(const int16_t *frames, uint32_t count, uint32_t ms, uint32_t *taken);
+
+/**
+ * @brief Close the stream and wait until what it held has been heard.
+ *
+ * Blocks. A task that never calls it loses the stream after
+ * KODE_AUDIO_STREAM_IDLE_MS without a write.
+ *
+ * @return true when the speaker is free again; false with kode_error() saying
+ *         why, "no stream is open" when it was closed for silence included.
+ */
+bool kode_audio_stream_close(void);
 
 /**
  * @brief Play a tone and wait until it has been heard.
@@ -1358,6 +1411,37 @@ const char *kode_http_get(const char *url);
  * @return As for kode_http_get().
  */
 const char *kode_http_post(const char *url, const char *body);
+
+/**
+ * @brief Fetch the @p cap bytes of @p url from @p offset on, into a buffer of
+ *        the caller's own: a resource too big for kode_http_get(), a range at
+ *        a time.
+ *
+ * Blocks. Each call is a connection of its own, and a redirect is not
+ * followed. The call is true whenever the server answered, and
+ * kode_http_status() says what @p buf holds: 206, the bytes from @p offset;
+ * 200, the resource from byte 0 - the server ignores ranges - of which only
+ * @p cap bytes were read, and only when @p offset is 0: to a later @p offset
+ * a 200 leaves @p got 0, since its bytes are not the ones asked for; 416,
+ * nothing - @p offset is past the end. Any other status (a 404, a 403, a 302)
+ * is the server's page about the request, not the resource, and @p got is 0
+ * for it too. A file is put together by appending each range with
+ * kode_file_append_bytes() and asking the next from the size the file has,
+ * for as long as the answer is a 206 (or a 200 to the first range, which has
+ * the whole resource when @p got is under @p cap).
+ *
+ * @param url    As for kode_http_get().
+ * @param offset The first byte wanted.
+ * @param buf    Where the bytes go; what it holds after a failure is unspecified.
+ * @param cap    Its room, above 0.
+ * @param got    Out, may be NULL: the bytes written; 0 on failure.
+ * @param total  Out, may be NULL: the length of the whole resource when the
+ *               server says it (a 206 and a 416 do), else 0; one longer than
+ *               the type holds reads as KODE_HTTP_OFF_MAX.
+ * @return true when the server answered; false with kode_error() saying why.
+ */
+bool kode_http_get_range(const char *url, kode_http_off_t offset, void *buf, uint32_t cap,
+                         uint32_t *got, kode_http_off_t *total);
 
 /**
  * @brief The status this task's last request was answered with.
@@ -2161,6 +2245,29 @@ bool kode_rfid_emulate_stop(void);
  * @return true when the level is on its way; false with kode_error() saying why.
  */
 bool kode_display_set_brightness(uint8_t pct);
+
+/** @brief How long kode_display_sleep() waits for the display, in ms. */
+#define KODE_DISPLAY_SLEEP_BOUND_MS 2000U
+
+/**
+ * @brief Put the display to sleep, or wake it.
+ *
+ * Asleep, the panel and its link to the processor are off: the glass is dark
+ * and the board draws less than at a brightness of 0, which leaves both
+ * running. The touch keeps reading, so a touch event can be what wakes it.
+ * On waking, the screen comes back as the app last left it, at the brightness
+ * it had; what the app draws while it sleeps shows then.
+ *
+ * Waits until the display is as asked, up to KODE_DISPLAY_SLEEP_BOUND_MS: a
+ * sleep waits for the screen to finish the frame it draws, up to 1.5 s, then
+ * puts the panel to sleep and takes its link down. Already asleep, or already
+ * awake, is true at once. One task at a time.
+ *
+ * @param sleep true to sleep, false to wake.
+ * @return true when the display is as asked; false with kode_error() saying
+ *         why: a screenshot is being read, the display did not answer in time.
+ */
+bool kode_display_sleep(bool sleep);
 
 /* ---- Touch ---- */
 

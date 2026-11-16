@@ -312,6 +312,9 @@ _Static_assert(sizeof(WifiFramesTickEvt) <= KQP_BLOCK_SMALL,
                "WifiFramesTickEvt must fit the small pool");
 _Static_assert((sizeof(WifiFrameEvt) > KQP_BLOCK_SMALL) && (sizeof(WifiFrameEvt) <= KQP_BLOCK_MEDIUM),
                "WifiFrameEvt must land in the medium pool");
+/* The longest key and the longest value of the app's store, in one event. */
+_Static_assert(sizeof(BootNvsSetEvt) <= KQP_BLOCK_MEDIUM,
+               "BootNvsSetEvt must fit the medium pool");
 _Static_assert(sizeof(StoragePathEvt) <= KQP_BLOCK_MEDIUM,
                "StoragePathEvt must fit the medium pool");
 _Static_assert(sizeof(StoragePathRspEvt) <= KQP_BLOCK_SMALL,
@@ -407,6 +410,13 @@ _Static_assert(sizeof(FlashReqEvt) <= KQP_BLOCK_LARGE,
                "FlashReqEvt must not reach the jumbo pool");
 _Static_assert(sizeof(NetStreamOpenEvt) <= KQP_BLOCK_LARGE,
                "NetStreamOpenEvt must not reach the jumbo pool");
+_Static_assert(sizeof(NetStreamFromEvt) <= KQP_BLOCK_LARGE,
+               "NetStreamFromEvt must not reach the jumbo pool");
+_Static_assert(sizeof(NetStreamFromRspEvt) <= KQP_BLOCK_SMALL,
+               "NetStreamFromRspEvt must fit the small pool");
+/* A progress event goes out per chunk of a download, with a margin. */
+_Static_assert(sizeof(HttpFileEvt) <= KQP_BLOCK_SMALL,
+               "HttpFileEvt must fit the small pool");
 _Static_assert(sizeof(StorageWriteEvt) <= KQP_BLOCK_LARGE,
                "StorageWriteEvt must not reach the jumbo pool");
 _Static_assert(sizeof(StorageWriteRspEvt) <= KQP_BLOCK_LARGE,
@@ -431,6 +441,10 @@ _Static_assert(sizeof(WifiStateEvt) <= KQP_BLOCK_LARGE,
                "WifiStateEvt must not reach the jumbo pool");
 _Static_assert(sizeof(DisplayStateEvt) <= KQP_BLOCK_LARGE,
                "DisplayStateEvt must not reach the jumbo pool");
+_Static_assert(sizeof(DisplaySleepReqEvt) <= KQP_BLOCK_SMALL,
+               "DisplaySleepReqEvt must fit the small pool");
+_Static_assert(sizeof(DisplaySleepEvt) <= KQP_BLOCK_SMALL,
+               "DisplaySleepEvt must fit the small pool");
 _Static_assert(sizeof(DisplayCaptureReqEvt) <= KQP_BLOCK_LARGE,
                "DisplayCaptureReqEvt must not reach the jumbo pool");
 _Static_assert(sizeof(DisplayCaptureRspEvt) <= KQP_BLOCK_LARGE,

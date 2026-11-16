@@ -19,6 +19,7 @@
 #include "kapp_cat.h"
 #include "kqp.h"
 #include "kode_init.h"
+#include "kode_http_off.h"   /* kode_http_off_t, KODE_HTTP_OFF_MAX */
 
 #ifdef __cplusplus
 extern "C" {
@@ -90,6 +91,48 @@ kode_status_t kode_sys_led_set_rgb(uint8_t r, uint8_t g, uint8_t b);
  * @return As the commands' rule above; KODE_DENIED for a level out of range.
  */
 kode_status_t kode_sys_screen_brightness(uint8_t pct);
+
+/**
+ * @brief Put the display to sleep, or wake it.
+ *
+ * Asleep is the panel in sleep-in and its link to the processor down: the
+ * glass is dark, nothing is drawn, and the touch keeps reporting. That is what
+ * a brightness of 0 leaves running. The saving is the panel's and the link's
+ * own draw.
+ *
+ * To sleep, AO_Display first asks whoever draws to stop, with
+ * DISPLAY_PARK_SIG (DisplayParkEvt): a kscreen renderer answers in
+ * kscreen_park(), one of the app's own with kode_sys_screen_parked(), and
+ * neither draws again before DISPLAY_REPAINT_SIG. A renderer is whoever has
+ * asked for the panel's state (display_state_request()) or flushed, drawn
+ * yet or not. Every park carries a number, and only the answer that names
+ * the park in hand settles the sleep: one that comes late, or never, leaves
+ * the next sleep its own. The link goes down only after that answer, and a
+ * renderer that gives none in KODE_LOWPOWER_GLYPHS_WAIT_MS leaves the glass
+ * lit. To wake, the link and the panel come back, the brightness is the one
+ * the glass had, and DISPLAY_REPAINT_SIG has the renderer paint it whole.
+ *
+ * Each call that returns KODE_OK ends in one DISPLAY_SLEEP_SIG (DisplaySleepEvt)
+ * on the bus: KODE_OK when the glass is as asked, also when it already was;
+ * otherwise the reason. A wake the panel refuses is tried again every
+ * KODE_DISPLAY_RESTORE_RETRY_MS and answered when it works. With AO_LowPower
+ * the board's rest has the glass first: a round takes it as it finds it, and
+ * the AWAKE that ends the rest wakes it, with no DISPLAY_SLEEP_SIG of its own:
+ * DISPLAY_REPAINT_SIG says the glass is back.
+ *
+ * @param sleep true to sleep, false to wake.
+ * @return As the commands' rule above.
+ */
+kode_status_t kode_sys_screen_sleep(bool sleep);
+
+/**
+ * @brief Tell AO_Display the app's renderer has stopped drawing: the answer to DISPLAY_PARK_SIG.
+ * @note For a renderer of the app's own. kscreen answers in kscreen_park().
+ * @param seq The DisplayParkEvt's @c seq: each park is answered with its own.
+ * @return As the commands' rule above; KODE_DENIED for a @p seq of 0, which no
+ *         park carries.
+ */
+kode_status_t kode_sys_screen_parked(uint32_t seq);
 
 /* ---- Infrared: to AO_Ir; without KODEOS_RADIO (the block is on the C5) AO_Ir refuses ----
  * The C5 link, for this command and the infrared requests below: one that
@@ -550,11 +593,14 @@ kode_status_t kode_sys_exp_power(bool on);
 kode_status_t kode_sys_exit_to_os(void);
 
 /*
- * With CONFIG_KODEOS_HOME_HOLD (on by default in an app) holding BOT publishes
- * HOME_SIG and resets the board KODE_SYS_HOME_GRACE_MS later, as
- * kode_sys_exit_to_os() does. An app with something to save defers from its
- * HOME_SIG handler, writes, then resets; the wait is capped at
- * KODE_SYS_HOME_DEFER_MAX_MS from the hold.
+ * With CONFIG_KODEOS_HOME_HOLD (on by default in an app) holding BOT for
+ * KODE_HOME_HOLD_MS publishes HOME_SIG and resets the board
+ * KODE_SYS_HOME_GRACE_MS later, as kode_sys_exit_to_os() does. The ordinary
+ * hold of the same press, KODE_BUTTON_HOLD_MS in, is BUTTON_HOLD_SIG and the
+ * app's own. An app with something to save defers from its HOME_SIG handler,
+ * writes, then resets; the wait is capped at KODE_SYS_HOME_DEFER_MAX_MS from
+ * HOME_SIG. Without the option HOME_SIG goes out at the ordinary hold and
+ * nothing resets.
  */
 
 /**
@@ -574,6 +620,25 @@ kode_status_t kode_sys_home_defer(void);
  * @return As the commands' rule above.
  */
 kode_status_t kode_sys_home_now(void);
+
+/* ---- The store: to AO_Boot, which writes it from its own thread ---- */
+
+/**
+ * @brief Store @p value under @p key, for kode_sys_nvs_get() to read back.
+ *
+ * The call waits on no flash, so an Active Object and a kode_worker job may
+ * make it. Both strings are copied before it returns. Nobody is answered: a
+ * pair the store refuses is a warning in the log. The pairs are written in
+ * the order they are asked, and one asked before kode_sys_exit_to_os() or
+ * kode_sys_home_now() is written before the board leaves; one that reaches
+ * AO_Boot once the board is leaving, or during a factory reset, is dropped
+ * with a notice in the log.
+ * @param key   At most KODE_SYS_NVS_KEY_MAX - 1 characters, not empty.
+ * @param value At most KODE_SYS_NVS_VALUE_MAX - 1 characters; may be empty.
+ * @return As the commands' rule above; KODE_DENIED for an unusable @p key or
+ *         @p value.
+ */
+kode_status_t kode_sys_nvs_set(const char *key, const char *value);
 
 /* =========================================================================
  * Requests
@@ -732,6 +797,12 @@ kode_status_t kode_sys_ir_last(QActive *me);
 /** @brief The frames the stream holds ahead of the speaker (200 ms); it holds the codec from open to close. */
 #define KODE_SYS_AUDIO_STREAM_FRAMES  9600U
 
+/* The canonical value is kqp_config.h's; guarded so a file seeing both has one. */
+#ifndef KODE_SYS_AUDIO_STREAM_IDLE_MS
+/** @brief How long an open stream may go without a write before AO_Audio closes it. */
+#define KODE_SYS_AUDIO_STREAM_IDLE_MS  10000U
+#endif
+
 /** @brief The longest path a recording into a file names, NUL included. */
 #define KODE_SYS_AUDIO_PATH_MAX  96U
 
@@ -802,6 +873,11 @@ kode_status_t kode_sys_audio_record_file(QActive *me, const char *path, uint32_t
 /**
  * @brief Open the stream at KODE_SYS_AUDIO_RATE_HZ; it holds the codec until closed.
  * @note Only @p me writes (kode_sys_audio_stream_write()) and closes the stream it opened.
+ * @note AO_Audio closes a stream that goes KODE_SYS_AUDIO_STREAM_IDLE_MS
+ *       without a write that put frames in, counted from the open while there
+ *       has been none. Nobody is answered: @p me stops being its writer, so
+ *       its next write is KODE_DENIED. A close asked while that close drains
+ *       is answered with it; one asked after it is KODE_DENIED.
  * @param me The asking AO; AUDIO_STREAM_OPEN_RSP_SIG answers it once the stream plays.
  * @return As the requests' rules above.
  */
@@ -1218,7 +1294,7 @@ kode_status_t kode_sys_file_write(QActive *me, const char *path, const void *dat
 /** @brief What a ping session added up to: @c ip4, @c tx, @c rx, @c min_ms, @c avg_ms, @c max_ms. */
 typedef NetPingStats kode_sys_ping_stats_t;
 
-/** @brief What an HTTP request came back with: @c status, @c content_length, @c body_len, @c kept, @c truncated. */
+/** @brief What an HTTP request came back with: @c status, @c content_length, @c body_len, @c kept, @c truncated, @c range_total. */
 typedef NetHttpResult kode_sys_http_result_t;
 
 /** @brief The longest host a request names, NUL included. */
@@ -1274,6 +1350,81 @@ kode_status_t kode_sys_net_ping(QActive *me, const char *host, uint8_t count);
  * @return As the requests' rules above.
  */
 kode_status_t kode_sys_http_get(QActive *me, const char *url, void *buf, uint32_t cap);
+
+/**
+ * @brief GET the @p cap bytes of a URL from @p offset on: a resource too big
+ *        for one buffer, a range at a time.
+ * @note LENT: AO_Net's worker writes @p buf until NET_HTTP_RSP_SIG arrives.
+ * @note The answer's @c result.status says where the bytes start: 206, at
+ *       @p offset, and @c range_total is then the length of the whole
+ *       resource when the server says it; 200, at byte 0 - the server ignores
+ *       ranges and sent the body from its start, of which only @p cap bytes
+ *       were read (@c truncated says more followed), kept only when @p offset
+ *       is 0; 416, nowhere - @p offset is past the end. Any other status (a
+ *       404, a 403, a redirect, which is not followed) is the server's page,
+ *       not the resource: its body is left unread and @c kept is 0, as for a
+ *       416 and for a 200 to an @p offset above 0. Each range is a connection of its own, and shares
+ *       kode_sys_http_get()'s turn: one GET or range per AO at a time.
+ * @param me     The asking AO; NET_HTTP_RSP_SIG answers it.
+ * @param url    Shorter than KODE_SYS_NET_URL_MAX.
+ * @param offset The first byte wanted.
+ * @param buf    Where the bytes go.
+ * @param cap    Its room, above 0.
+ * @return As the requests' rules above; KODE_DENIED also for a NULL @p buf, a
+ *         zero @p cap, or a range that runs past KODE_HTTP_OFF_MAX.
+ */
+kode_status_t kode_sys_http_get_range(QActive *me, const char *url, kode_http_off_t offset,
+                                      void *buf, uint32_t cap);
+
+/** @brief The longest URL a download into a file names, NUL included. */
+#define KODE_SYS_HTTP_FILE_URL_MAX  256U
+
+/* cppcheck-suppress misra-c2012-2.3 ; an answer's name for the apps that read it, never used inside the SDK */
+/** @brief A download's progress (HTTP_FILE_PROGRESS_SIG) and its end (HTTP_FILE_RSP_SIG):
+ *         @c rc, @c stopped, @c status, @c written, @c size, @c total. */
+typedef HttpFileEvt kode_sys_http_file_answer_t;
+
+/**
+ * @brief Download a URL into a file, however big, and take it up again where
+ *        a cut left it.
+ *
+ * AO_Storage asks for the body from the length the file at @p path already
+ * has - nothing, for a new file - and appends what arrives, 32 KiB at a time,
+ * over one connection. @p me is posted one HTTP_FILE_PROGRESS_SIG per chunk
+ * in the file and one HTTP_FILE_RSP_SIG at the end. If the link drops or the
+ * medium refuses a chunk, the end says so and the file keeps what it has:
+ * the same call again goes on from there. To start over, delete the file
+ * first.
+ *
+ * @note The end's @c status says how the server took it: 200, the body from
+ *       its start; 206, the rest of it; 416 with KODE_OK, the file is as long
+ *       as the resource already; 416 with KODE_DENIED, the file is longer, or
+ *       the server did not say how long the resource is; 200 with
+ *       KODE_DENIED, a server that ignores ranges was asked for the rest. A
+ *       refusal leaves the file as it was. A redirect is not followed: it
+ *       ends the download with KODE_ERROR and its status.
+ * @note The rest is asked for by length alone: a file that is not the start
+ *       of this resource is taken up all the same.
+ * @note One download at a time on the board: a second, and kodeOS's install
+ *       from a URL while one runs, are refused KODE_DENIED. The board does not
+ *       rest while one runs. A file can hold 4 GB at most (FAT32).
+ * @param me   The asking AO.
+ * @param url  http:// or https://, shorter than KODE_SYS_HTTP_FILE_URL_MAX.
+ * @param path Where it goes: absolute and virtual, shorter than
+ *             KODE_SYS_FILE_PATH_MAX, in a folder that exists.
+ * @return As the requests' rules above; KODE_DENIED without CONFIG_KODEOS_NET.
+ */
+kode_status_t kode_sys_http_get_file(QActive *me, const char *url, const char *path);
+
+/**
+ * @brief End the download @p me started; its HTTP_FILE_RSP_SIG follows with
+ *        @c stopped true and what was written kept.
+ * @param me The AO that called kode_sys_http_get_file().
+ * @return KODE_OK when AO_Storage took it, also with no download to end;
+ *         KODE_DENIED for a NULL @p me or without CONFIG_KODEOS_NET;
+ *         KODE_NO_RESOURCES when its queue has no room.
+ */
+kode_status_t kode_sys_http_file_stop(QActive *me);
 
 /**
  * @brief POST @p body to a URL and keep the answer's body in @p buf.
@@ -1358,7 +1509,8 @@ kode_status_t kode_sys_wifi_scan(QActive *me);
  * listens on the network's own channel or refuses. One AO listens at a time.
  * AO_Radio posts the answers to @p me, never publishes them, and keeps
  * KQP_FRAMES_MARGIN slots of its queue free: what does not fit is counted in
- * the next tick's @c dropped. That count is this chip's alone: a frame the
+ * the next tick's @c dropped, as are the records of a batch that did not come
+ * whole. That count is this chip's alone: a frame the
  * C5 could not queue or fit in a batch is in @c heard and in no drop count,
  * and a tick this chip could not post is counted nowhere. A tick's
  * @c channel is the radio's when the batch was sent, so frames heard while a
@@ -1377,7 +1529,20 @@ typedef WifiFramesStateEvt kode_sys_wifi_frames_state_t;
 typedef WifiFramesTickEvt kode_sys_wifi_frames_tick_t;
 
 /* cppcheck-suppress misra-c2012-2.3 ; a frame's name for the apps that read it, never used inside the SDK */
-/** @brief One frame heard (WIFI_FRAME_SIG): @c channel, @c rssi, @c fc, @c addr1, @c addr2, @c len and @c head. */
+/** @brief One frame heard (WIFI_FRAME_SIG): @c channel, @c rssi, @c fc, @c addr1, @c addr2, @c addr3, @c len,
+ *         @c head_len and @c head.
+ *
+ * @c head is the first KWIFI_FRAME_HEAD_LEN bytes after the MAC header of a
+ * management or a control frame. In a beacon and a probe response that is the
+ * 12 fixed bytes - the capabilities at 10, privacy their bit 4 - and the first
+ * element, the network's name, whole up to its 32 bytes. A data frame's
+ * @c head is zeros and its @c head_len 0, from any C5: what follows its
+ * header is a third party's traffic.
+ * @c addr3 is the network's address in a management frame, a
+ * deauthentication among them; in a data frame it is the address its To DS
+ * and From DS bits (@c fc[1], bits 0 and 1) give it. @c head_len says how
+ * many bytes of @c head are kept: 8, with @c addr3 zeros, from a C5 older
+ * than the longer head - the name is not in those. */
 typedef WifiFrameEvt kode_sys_wifi_frame_t;
 
 /**
@@ -1567,6 +1732,14 @@ bool kode_sys_nfc_is_emulating(void);
  */
 bool kode_sys_rfid_is_emulating(void);
 
+/* ---- The screen: AO_Display's word on the glass ---- */
+
+/**
+ * @brief Whether the display is asleep: by kode_sys_screen_sleep(), or by the board's own rest.
+ * @return true from the moment the link is down until the glass is back.
+ */
+bool kode_sys_screen_is_asleep(void);
+
 /* ---- Touch: AO_Touch's reports of the finger ---- */
 
 /**
@@ -1606,7 +1779,8 @@ bool kode_sys_console_congested(void);
 /**
  * @brief Read back what is stored under @p key.
  * @note Waits on the store's lock while another task writes or erases flash.
- *       Not from a kode_worker job. kode.h's kode_setting_set() stores a value.
+ *       Not from a kode_worker job. The command kode_sys_nvs_set() stores a
+ *       value from an Active Object, kode.h's kode_setting_set() from a task.
  * @param key At most KODE_SYS_NVS_KEY_MAX - 1 characters, not empty.
  * @param out Destination, NUL-terminated on KODE_OK and untouched otherwise.
  * @param cap Size of @p out; a value that does not fit is an error, not a truncation. KODE_SYS_NVS_VALUE_MAX always fits.

@@ -1438,6 +1438,67 @@ void display_minute_request(void);
  */
 void display_brightness_request(uint8_t pct, bool persist);
 
+/* ---- The glass asleep ------------------------------------------------------
+ * kode_sys_screen_sleep() posts DISPLAY_SLEEP_REQ_SIG. To sleep, AO_Display
+ * parks whoever draws (DISPLAY_PARK_SIG, answered with kode_sys_screen_parked()),
+ * puts the panel in sleep-in and takes its link down; to wake, it brings both
+ * back, gives the brightness and publishes DISPLAY_REPAINT_SIG. Each request
+ * ends in one DISPLAY_SLEEP_SIG. A task hears no event, so the same is kept in
+ * two words any thread may read: display_asleep() and display_sleep_last().
+ * With AO_LowPower the board's rest outranks the request: a round takes the
+ * glass over as it finds it, and the AWAKE that ends the rest wakes it.
+ */
+
+/** @brief How the last request to sleep or wake the glass ended. */
+typedef struct {
+    uint16_t answers;   /**< Requests answered since the boot; it wraps.     */
+    uint8_t  rc;        /**< The last answer's kode_status_t.                */
+    uint8_t  why;       /**< The last answer's display_sleep_why_t.          */
+} display_sleep_last_t;
+
+/**
+ * @brief Whether the glass is at rest: its link down, the panel asleep or, in
+ *        the board's ASLEEP, dimmed and showing its memory.
+ *
+ * A plain read of one word, from any thread. True from the moment AO_Display
+ * has taken the link down until it has brought the glass back.
+ *
+ * @return true while the glass is at rest.
+ */
+bool display_asleep(void);
+
+/**
+ * @brief How the last request to sleep or wake the glass ended.
+ *
+ * A plain read of one word, from any thread. AO_Display writes it just before
+ * it publishes DISPLAY_SLEEP_SIG, so a change of @c answers is one more
+ * request answered.
+ *
+ * @param out Filled; all zero before the first answer.
+ */
+void display_sleep_last(display_sleep_last_t *out);
+
+/**
+ * @brief A reason of DisplaySleepEvt in words, for a log line or an error text.
+ * @param why A display_sleep_why_t.
+ * @return The words; "" for DISPLAY_SLEEP_WHY_NONE and for a value that is no reason.
+ */
+const char *display_sleep_why_text(uint8_t why);
+
+/**
+ * @brief Tell AO_Display the renderer has stopped drawing, and hand it the
+ *        glyphs the minute is drawn from.
+ *
+ * What a renderer answers a round of AO_LowPower with; an app's sleep
+ * (DISPLAY_PARK_SIG) is answered with kode_sys_screen_parked(). The hand-over
+ * carries no park number, whatever @c park @p e holds. The strip is not
+ * copied: it stays the caller's, in PSRAM, until the next AWAKE (see
+ * DisplayGlyphsEvt). The event is copied; @p e need not outlive the call.
+ *
+ * @param e The glyphs and where they go; NULL when the renderer has none to give.
+ */
+void display_glyphs_hand(const DisplayGlyphsEvt *e);
+
 /* ---- Capture: a picture of the panel ------------------------------------
  * AO_Display owns the panel, so a capture is asked for. The answer is a loan:
  * the 402 KB buffer is collected separately and held until released, like
@@ -1717,7 +1778,8 @@ void ioexp_test_request(void);
 /* ---- AO_Buttons: owner of the six push-buttons --------------------------
  * Five are bits of AO_IoExp's publish, the sixth is GPIO35. Two equal samples
  * KODE_SYS_BUTTON_SETTLE_MS apart move a button; BUTTON_EVT_SIG goes out on change.
- * Top and bottom publish BUTTON_HOLD_SIG after KODE_BUTTON_HOLD_MS; top publishes
+ * Top and bottom publish BUTTON_HOLD_SIG after KODE_BUTTON_HOLD_MS, and bottom,
+ * held on, BUTTON_HOME_HOLD_SIG after KODE_HOME_HOLD_MS; top publishes
  * BUTTON_DOUBLE_SIG for a second press within KODE_BUTTON_DOUBLE_MS of the first's
  * release (not after a hold).
  */
@@ -2677,6 +2739,25 @@ kode_status_t net_http_ask(QActive *who, bool post, const char *url, const void 
                            uint32_t len, const char *ctype, void *buf, uint32_t cap);
 
 /**
+ * @brief GET the @p cap bytes of @p url from @p offset on; answered with
+ *        NET_HTTP_RSP_SIG, as a GET, and through the same door: one at a time.
+ *
+ * The answer's status is 206 for a range the server served and 200 when it
+ * ignored the range and sent the body from its first byte, of which only
+ * @p cap bytes are read; @c range_total is the length of the whole resource
+ * when the server says it.
+ *
+ * @param who    The asking AO.
+ * @param url    Shorter than KODE_NET_URL_MAX; copied.
+ * @param offset The first byte wanted.
+ * @param buf    Where the bytes go, lent.
+ * @param cap    Its room, above 0.
+ * @return As the asks above.
+ */
+kode_status_t net_http_range_ask(QActive *who, const char *url, uint64_t offset, void *buf,
+                                 uint32_t cap);
+
+/**
  * @brief Send one datagram; answered with NET_UDP_RSP_SIG.
  * @param who  The asking AO.
  * @param host As net_lookup_ask().
@@ -3622,6 +3703,30 @@ void storage_write_all_request(const char *name, const void *data,
                                uint32_t len, QActive *who);
 
 /**
+ * @brief Download @p url into the file at @p path; answered to @p who with one
+ *        HTTP_FILE_PROGRESS_SIG per chunk in the file and one HTTP_FILE_RSP_SIG.
+ *
+ * AO_Storage leads: it asks AO_Net for the body from the length the file has
+ * (0 for a new one), so asking again after a cut takes the download up where
+ * it stopped. One download at a time on the board, and one ask per AO.
+ *
+ * @param who  The asking AO.
+ * @param url  Shorter than KODE_NET_FETCH_URL_MAX; copied.
+ * @param path Absolute, virtual, shorter than KODE_PATH_MAX; copied.
+ * @return As the asks above; KODE_NO_RESOURCES also when PSRAM has no room
+ *         for the download's record.
+ */
+kode_status_t storage_fetch_ask(QActive *who, const char *url, const char *path);
+
+/**
+ * @brief End the download @p who asked for; its HTTP_FILE_RSP_SIG follows,
+ *        @c stopped true. With no download of @p who's running nothing happens.
+ * @param who The AO that asked for the download.
+ * @return KODE_OK when AO_Storage's queue took it; KODE_NO_RESOURCES otherwise.
+ */
+kode_status_t storage_fetch_stop(QActive *who);
+
+/**
  * @brief The buffer a STORAGE_DATA_SIG is talking about.
  *
  * Valid only between receiving that event and handing the index back with
@@ -3636,6 +3741,24 @@ const uint8_t *storage_buf(uint8_t idx);
 
 /** @brief Open @p url for reading; the answer goes to @p who. */
 void net_stream_open_request(const char *url, QActive *who);
+
+/**
+ * @brief Open @p url for reading from @p offset on: the rest of a download
+ *        that was cut. The answer goes to @p who, as net_stream_open_request()'s.
+ *
+ * The answer is NET_STREAM_FROM_RSP_SIG (NetStreamFromRspEvt), KODE_OK only
+ * when the body starts at @p offset. It carries the server's status either
+ * way: 206 for the rest, 200 with KODE_ERROR for a server that ignores ranges
+ * and would send the body from its first byte, 416 with KODE_ERROR when
+ * nothing lies past @p offset.
+ *
+ * @param url    Shorter than KODE_NET_FETCH_URL_MAX; copied.
+ * @param offset The bytes already had; 0 asks for the whole body.
+ * @param who    Where the response and the data go.
+ * @return false when there is no event for it or @p url is too long: nothing
+ *         was posted and no answer follows.
+ */
+bool net_stream_open_from_request(const char *url, uint32_t offset, QActive *who);
 
 /** @brief Ask for the next chunk (NET_STREAM_DATA_SIG). */
 void net_stream_read_request(void);
@@ -4528,17 +4651,6 @@ bool lowpower_wake_at(uint8_t who, uint64_t due_us);
  * @param why   Why, at most KODE_LOWPOWER_WHY_MAX - 1 characters; NULL for none.
  */
 void lowpower_ready(uint8_t who, uint32_t round, bool busy, const char *why);
-
-/**
- * @brief Hand AO_Display the glyphs the minute is drawn from.
- *
- * The strip is not copied: it stays the caller's, in PSRAM, until the next
- * AWAKE (see DisplayGlyphsEvt). The event is copied; @p e need not outlive
- * the call.
- *
- * @param e The glyphs and where they go.
- */
-void display_glyphs_hand(const DisplayGlyphsEvt *e);
 
 /**
  * @brief Tell AO_Radio that AO_Net has closed its sessions for an OFF round.

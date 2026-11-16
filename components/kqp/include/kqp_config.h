@@ -361,6 +361,12 @@
                                                 *   was asleep at the last write, and a reset ended it. */
 #define KODE_DISPLAY_RESTORE_RETRY_MS  200U    /**< AO_Display's wait before it puts the glass back again
                                                 *   after the link or the panel refused to wake. */
+#define KODE_DISPLAY_SLEEP_WAIT_MS     2000U   /**< Longest kode_display_sleep() waits for AO_Display to
+                                                *   sleep the glass or wake it: the renderer's
+                                                *   KODE_LOWPOWER_GLYPHS_WAIT_MS, then the panel's sleep-in
+                                                *   and the link, about 210 ms. */
+_Static_assert(KODE_DISPLAY_SLEEP_WAIT_MS > KODE_LOWPOWER_GLYPHS_WAIT_MS,
+               "a task's wait for the glass outlasts the renderer's time to stop drawing");
 
 /* ---- AO_Scheduler: the table, the clock and the lines it runs -------------- */
 #define KODE_SCHED_MAX           16U     /**< Entries, the built-in `mqtt` included (its slot is always taken). */
@@ -555,6 +561,20 @@ _Static_assert(KODE_PRIO_STANDARD_READER > KODE_PRIO_USER_GUI, "the background r
  * of them; a console line (KODE_CONSOLE_LINE_MAX) carries fewer. A file name
  * is still bounded by KODE_APP_FILE_MAX. */
 #define KODE_FLASH_SRC_MAX       257U
+/* A URL a download into a file names, terminator included: 255 characters.
+ * One less than a source string so that the offset a resumed download starts
+ * from fits beside it in the large event block (NetStreamFromEvt). */
+#define KODE_NET_FETCH_URL_MAX   256U
+/* A chunk of a download into a file that finds another transfer holding the
+ * one file handle is tried again this often, for KODE_STORAGE_TURN_MS in
+ * all: the bound every request that waits its turn at AO_Storage has. */
+#define KODE_HTTP_FILE_RETRY_MS  50U
+/* How long a download into a file waits for AO_Net's next chunk before it
+ * gives up. AO_Net answers a read within its own guard (the driver's 20 s and
+ * KODE_NET_STREAM_SLACK_MS), but forgets a transfer whose network went and
+ * tells its reader nothing: this is what ends that wait. Above the guard, so a
+ * read that is only slow is answered by AO_Net first. */
+#define KODE_HTTP_FILE_STALL_MS  30000U
 /* `dst=` values 0..2 are kfw_target_t. This one is not a container target -
  * nothing declares itself "for the mailbox" - it is an instruction to park
  * whatever arrives without decoding it. */
@@ -908,6 +928,20 @@ _Static_assert(KODE_NET_CHECK_DWELL_MS < KODE_LOWPOWER_REQUEST_RETRY_WINDOW_MS,
  */
 #define KODE_BUTTON_HOLD_MS     600U
 /**
+ * @brief How long the bottom button must stay pressed to be the home hold.
+ *
+ * Counted from the press, on the clock that counted KODE_BUTTON_HOLD_MS:
+ * AO_Buttons publishes BUTTON_HOME_HOLD_SIG when it fires, and in an app
+ * built with CONFIG_KODEOS_HOME_HOLD that is the gesture that goes home to
+ * kodeOS. Three seconds is long enough that an app can spend the ordinary
+ * hold of the same button on something of its own, and well short of the 16 s
+ * at which the PMIC cuts the board's supply on this button (its QON pin). An
+ * app that defers adds KODE_SYS_HOME_DEFER_MAX_MS at most to it.
+ */
+#define KODE_HOME_HOLD_MS       3000U
+_Static_assert(KODE_HOME_HOLD_MS > KODE_BUTTON_HOLD_MS,
+               "the home hold is the hold, held on");
+/**
  * @brief How soon after the first press's release the top button's second
  * press must be confirmed to make a double.
  *
@@ -921,16 +955,21 @@ _Static_assert(KODE_NET_CHECK_DWELL_MS < KODE_LOWPOWER_REQUEST_RETRY_WINDOW_MS,
 /**
  * @brief How long AO_Boot waits after announcing home before it resets.
  *
- * A held bottom button always comes home (CONFIG_KODEOS_HOME_HOLD), and the
- * hold goes out as HOME_SIG before the reset so an app can hear it. This is
- * what that hearing is worth: 200 ms (200 QP ticks), long enough for an AO one
- * step below AO_Boot to run its handler and write a file, short enough that
- * the gesture still feels like the button did it. An app that needs more says
- * so with kode_sys_home_defer().
+ * A bottom button held KODE_HOME_HOLD_MS always comes home
+ * (CONFIG_KODEOS_HOME_HOLD), and the hold goes out as HOME_SIG before the
+ * reset so an app can hear it. This is what that hearing is worth: 200 ms
+ * (200 QP ticks), long enough for an AO one step below AO_Boot to run its
+ * handler and write a file, short enough that the gesture still feels like
+ * the button did it. An app that needs more says so with
+ * kode_sys_home_defer().
  */
 #define KODE_SYS_HOME_GRACE_MS      200U
 /**
- * @brief The longest a deferral can hold the board, from the hold itself.
+ * @brief The longest a deferral can hold the board, from HOME_SIG.
+ *
+ * Counted from the home hold, so a board whose app defers resets
+ * KODE_HOME_HOLD_MS + KODE_SYS_HOME_DEFER_MAX_MS after the press at the
+ * latest, plus the leave.
  *
  * The grace is for saving state, not for thinking. An app that asks for a
  * moment and never calls kode_sys_home_now() is reset anyway when this expires,
@@ -1375,6 +1414,17 @@ _Static_assert(KODE_IR_TEST_BUDGET_MS > (KODE_IR_LINK_WAIT_MS + (KODE_IR_TEST_TR
  *         the guard turns that into a named failure instead of a row that
  *         goes silent until the console's budget expires. */
 #define KODE_AUDIO_GUARD_MS       45000U
+/**
+ * @brief How long an open stream may go without a write before AO_Audio
+ *        closes it.
+ *
+ * The stream's frames skip AO_Audio, so a writer that stops and never closes
+ * would hold the codec for good. Ten seconds is longer than any pause a voice
+ * or a game leaves between two sounds, and short enough that a forgotten
+ * stream does not read as a speaker that stopped working. Counted from the
+ * last write that put frames in, or from the open when there was none.
+ */
+#define KODE_SYS_AUDIO_STREAM_IDLE_MS  10000U
 /** @brief Volume at boot. 100 is exactly zero decibels on this board; the
  *         user's volume is attenuation from here and never gain. */
 #define KODE_AUDIO_VOL_DEFAULT      100U
@@ -1800,6 +1850,7 @@ _Static_assert((KQP_POWER_POST_MARGIN * 2U) == KQP_POWER_QUEUE_LEN,
 #define KQP_ID_ANSWER_MARGIN    0U    /**< Slots an identity, signature or wipe answer leaves free: 0 only asks that there be one. */
 #define KQP_FRAMES_MARGIN       4U    /**< Slots a Wi-Fi frames tick or frame leaves free in its asker's queue: room for its own traffic and the answer to a stop. */
 #define KQP_FRAMES_ANSWER_MARGIN 0U   /**< Slots a Wi-Fi frames answer leaves free: 0 only asks that there be one. */
+#define KQP_FETCH_POOL_MARGIN   16U   /**< Small blocks a download's progress event leaves free (half the tier), for every other AO's small events; a chunk with no block for it goes unannounced. */
 #define KQP_FRAMES_POOL_MARGIN  16U   /**< Blocks a Wi-Fi frames tick (the small tier) or frame (the medium tier) leaves free in its tier, for every other AO's events; kqp.c pins each event to its tier. */
 _Static_assert((KQP_FRAMES_POOL_MARGIN > 0U) && (KQP_FRAMES_POOL_MARGIN < KQP_SMALL_POOL_COUNT),
                "a tick leaves some of the small tier free, and the tier has more than that");
