@@ -1355,7 +1355,7 @@ TEST_CASE("a field is read, written and dumped, mid-row included", "[audio_ao]")
      * ordinary register read - and the row in flight for the whole of this
      * case is the point: a question about the codec is answered whatever the
      * codec is doing. */
-    static uint8_t reg32 = 169U;
+    static uint8_t reg32 = 190U;
 
     audio_up();
     row_to_step2();
@@ -1378,8 +1378,8 @@ TEST_CASE("a field is read, written and dumped, mid-row included", "[audio_ao]")
         {
             AudioFieldEvt const * const a = (AudioFieldEvt const *)e;
             TEST_ASSERT_EQUAL_UINT(KDRV_ES_REG32, a->field);
-            TEST_ASSERT_EQUAL_INT_MESSAGE(169, a->value,
-                "0xA9 is what volume 100 writes under the speaker's cap");
+            TEST_ASSERT_EQUAL_INT_MESSAGE(190, a->value,
+                "0xBE is what volume 100 writes: one step under full scale");
             TEST_ASSERT_EQUAL_UINT(KODE_OK, a->rc);
             break;
         }

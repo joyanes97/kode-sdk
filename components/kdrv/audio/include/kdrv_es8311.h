@@ -75,27 +75,19 @@ extern "C" {
 /**
  * @brief The loudest the DAC is ever set, in tenth-decibels of full scale.
  *
- * Volume 100 is this and nothing reaches past it: register 0x32 reads 0xA9,
- * not 0xBF. It is the speaker's limit rather than the codec's, and it is
- * derived rather than chosen, from the validation bench's model - the one
- * that predicts every value it measured. Full scale is 1.9 Vrms at the codec;
- * the NS4150B multiplies that by its internal feedback resistor (measured
- * 220 to 250 kOhm, datasheet 240) over R2/R10; and the YN1811 may dissipate
- * 0.5 W, its maker's 96-hour test, at the 5.85 Ohm valley of its impedance,
- * which is 1.71 Vrms. The 270 kOhm rework meets that at full scale (1.69 Vrms,
- * 0.49 W measured); the board as drawn carries 120 kOhm, which puts full
- * scale at 3.96 Vrms and needs a cap of -7.3 dB.
- *
- * So -11.0 dB: the drawn value's cap with a whole register step of margin
- * over it, because fitted resistors have measured well under their drawn
- * value on earlier builds and a cap that trusts the drawing is a speaker
- * that overheats. It also keeps the build out of the clipping it shows at
- * full scale, because the thermal limit is the tighter one. What would move
- * it is R2/R10 measured on the build that ships, and a 3 kHz tone at volume
- * 100 measured at the speaker terminals against 1.71 Vrms; on the 270 kOhm
- * rework it goes to zero.
+ * Volume 100 is this and nothing reaches past it: -0.5 dB, register 0x32 at
+ * 0xBE, one register step under the DAC's full scale. The speaker sets it,
+ * by the validation bench's model. Full scale is 1.9 Vrms at the codec; the
+ * NS4150B multiplies that by its internal feedback resistor (measured 220 to
+ * 250 kOhm, datasheet 240) over R2/R10, which is 270 kOhm on every board
+ * that ships, V1 (the DVT) and V2; and the YN1811 may dissipate 0.5 W, its
+ * maker's 96-hour test, at the 5.85 Ohm valley of its impedance, which is
+ * 1.71 Vrms. Full scale gives 1.69 Vrms (0.49 W) at the datasheet's resistor
+ * and 1.76 Vrms (0.53 W) at the highest one measured; one step under it
+ * gives 1.66 Vrms (0.47 W) there. A board with smaller resistors at R2/R10
+ * needs a lower value here.
  */
-#define KDRV_ES8311_OUT_DB_X10_MAX  (-110)
+#define KDRV_ES8311_OUT_DB_X10_MAX  (-5)
 
 /* ---- Bring-up ------------------------------------------------------------ */
 
