@@ -513,6 +513,8 @@ kode_status_t kode_sys_power_off(void);
  * LowPowerPartEvt::parts says so at the next answer. With the radio at rest
  * AO_Radio goes on as with the board AWAKE: Wi-Fi joins its network again
  * and a C5 link that fell is built again; only the C5 sleeps between wakes.
+ * A scan, Wi-Fi or BLE, would fail on a C5 asleep between wakes, so it is
+ * answered KODE_DENIED at once instead.
  */
 
 #define KODE_SYS_REST_SCREEN 0x01U /**< The panel in sleep-in and its link down, as kode_sys_screen_sleep().        */
@@ -556,7 +558,12 @@ typedef struct {
  * A request made while another is being arranged is answered KODE_DENIED,
  * `rest: underway`, and the one in hand goes on to its own answer. One asker
  * at a time: the answer carries no number, so two of the app's that ask at
- * once cannot tell their answers apart.
+ * once cannot tell their answers apart. An owner that answers busy is asked
+ * again KODE_LOWPOWER_REQUEST_RETRY_MS later, as a requested round is begun
+ * again, while that ask falls inside KODE_LOWPOWER_REQUEST_RETRY_WINDOW_MS of
+ * the request; busy past it, the answer is KODE_DENIED with `part: why`, and
+ * the parts that rested stay at rest. An owner that does not answer in
+ * KODE_LOWPOWER_PART_STEP_MS is answered `part: no answer`, and not asked again.
  *
  * With KODE_SYS_REST_CPU the system's clock stops, as in the board's ASLEEP:
  * no Active Object counts time, so work in flight in an owner that was not
@@ -1573,8 +1580,10 @@ kode_status_t kode_sys_udp_send(QActive *me, const char *host, uint16_t port, co
  * leave the radio, seconds, and nothing longer: while a Bluetooth listen,
  * the boot's autojoin round (running or owed), the production row or an
  * install holds the radio it is answered at once with @c rc
- * KODE_NO_RESOURCES. Without CONFIG_KODEOS_WIFI the request is refused at
- * once with KODE_DENIED.
+ * KODE_NO_RESOURCES. While an app's rest has the radio (KODE_SYS_REST_RADIO)
+ * it is answered at once with @c rc KODE_DENIED: the C5 sleeps between wakes
+ * too long for a sweep, and kode_sys_rest_end() brings it back. Without
+ * CONFIG_KODEOS_WIFI the request is refused at once with KODE_DENIED.
  */
 
 /** @brief The most networks one sweep keeps: the strongest, the rest dropped. */
@@ -1596,9 +1605,10 @@ typedef WifiScanEntryEvt kode_sys_wifi_scan_entry_t;
 /**
  * @brief Answers kode_sys_wifi_scan() (WIFI_SCAN_RSP_SIG): @c rc, KODE_OK when the sweep
  *        ended, KODE_ERROR when it failed or the link went, KODE_NO_RESOURCES when the
- *        radio was busy (ask again), KODE_CANCELLED when a newer Wi-Fi request took its
- *        place (do not ask again at once); @c seen, the networks the sweep handed over;
- *        @c more, entries left out.
+ *        radio was busy (ask again), KODE_DENIED with the radio at rest for the app
+ *        (ask again after kode_sys_rest_end()), KODE_CANCELLED when a newer Wi-Fi request
+ *        took its place (do not ask again at once); @c seen, the networks the sweep handed
+ *        over; @c more, entries left out.
  */
 typedef ScanRspEvt kode_sys_wifi_scan_answer_t;
 
@@ -1682,7 +1692,8 @@ kode_status_t kode_sys_wifi_frames(QActive *me, bool on, uint8_t channel);
  * Wi-Fi on, and a listen owed behind that bring-up is refused when the round
  * starts, so the first listen asked on a cold link with Wi-Fi on is nearly
  * always busy: ask again once the round ends. With Bluetooth off in Settings
- * it is answered at once with @c rc KODE_DENIED, in every state. Without
+ * it is answered at once with @c rc KODE_DENIED, in every state, and so it is
+ * while the app's rest has the radio (KODE_SYS_REST_RADIO). Without
  * CONFIG_KODEOS_BLE the request is refused at once with KODE_DENIED.
  */
 
@@ -1706,9 +1717,10 @@ typedef BleScanEvt kode_sys_ble_scan_entry_t;
 /**
  * @brief Answers kode_sys_ble_scan() (BLE_SCAN_RSP_SIG): @c rc, KODE_OK when the listen
  *        ended, KODE_ERROR when it failed or the link went, KODE_NO_RESOURCES when the
- *        radio was busy (ask again), KODE_DENIED with Bluetooth off in Settings,
- *        KODE_CANCELLED when a newer Bluetooth request took its place (do not ask
- *        again at once); @c seen, the devices handed over; @c more, entries left out.
+ *        radio was busy (ask again), KODE_DENIED with the radio at rest for the app or
+ *        Bluetooth off in Settings, KODE_CANCELLED when a newer Bluetooth request took its
+ *        place (do not ask again at once); @c seen, the devices handed over; @c more,
+ *        entries left out.
  */
 typedef ScanRspEvt kode_sys_ble_scan_answer_t;
 

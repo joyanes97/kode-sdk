@@ -1783,7 +1783,8 @@ typedef enum {
     KODE_REST_CARD   = 1U << 4, /**< The card unmounted and unpowered, once: the next file on it brings it
                                  *   back, and kode_rest() asked again puts it away again.                 */
     KODE_REST_RADIO  = 1U << 5, /**< The radio chip asleep; Wi-Fi and Bluetooth keep their connections.
-                                 *   Needs KODE_REST_SOUND with it.                                        */
+                                 *   A scan, Wi-Fi or Bluetooth, is refused while it rests: the radio
+                                 *   sleeps between wakes too long for one. Needs KODE_REST_SOUND with it. */
     KODE_REST_CPU    = 1U << 6  /**< The processor sleeps whenever the app is waiting. Needs the screen at
                                  *   rest, and no USB cable.                                               */
 /* cppcheck-suppress misra-c2012-2.3 ; a public enum: an app names the type, and nothing in this tree does */
@@ -1800,15 +1801,20 @@ typedef struct {
     uint32_t after_ms;  /**< A time, in ms from the moment kode_rest() returns; 0 for none.   */
 } kode_rest_wake_t;
 
-/** @brief How long kode_rest() and kode_rest_end() wait for the board, in ms. */
-#define KODE_REST_BOUND_MS 24000U
+/** @brief How long kode_rest() and kode_rest_end() wait for the board, in ms: three
+ *         seconds a part, and the ten seconds a busy part is asked again for. */
+#define KODE_REST_BOUND_MS 34000U
 
 /**
  * @brief Put the named parts away and keep them away until kode_rest_end().
  *
  * Returns once every part named is at rest, which takes up to three seconds a
- * part. A part that is busy stops the call there: it returns false, the parts
- * that had rested stay at rest, and kode_error() names the one that did not.
+ * part. A part that is busy is asked again every second, for up to ten
+ * seconds from the call, as a sleep the board is asked for is; still busy
+ * then, it stops the call there: it returns false, the parts that had rested
+ * stay at rest, and kode_error() names the one that did not. A part that does
+ * not answer in its three seconds stops the call the same way, and is not
+ * asked again.
  * Called again, it adds parts and takes the new wake sources; it also wakes
  * a processor asleep for KODE_REST_CPU, which sleeps again only when the call
  * names that part. While another request is being arranged, the console's
@@ -1816,7 +1822,9 @@ typedef struct {
  *
  * kode_display_sleep(false) wakes a display the rest put to sleep. From then
  * the screen is not at rest, and KODE_REST_CPU is refused until it is again.
- * With the radio at rest Wi-Fi still joins its network again by itself.
+ * With the radio at rest Wi-Fi still joins its network again by itself, but
+ * kode_wifi_scan() and kode_ble_scan() fail at once and say the radio is at
+ * rest: kode_rest_end() first.
  *
  * With KODE_REST_CPU the board's own clock stops as well, so the system does
  * nothing that takes time until a wake: finish file and network work first,
