@@ -88,14 +88,15 @@ static uint32_t tag_next(uint32_t tag)
 /**
  * @brief Post one pass to AO_Display, leaving its queue the margin it keeps.
  *
- * A dry pool or a queue with no room is answered here, so the asker never
- * sleeps on a request that was not made.
+ * A dry pool or a queue with no room makes no request: nothing is written
+ * into @p ask and nobody is signalled, so no answer is left owed.
  *
  * @param ask The asker's state: where the answer lands.
  * @param job The pass; copied into the request.
  * @param gen The asker's tag for this request.
+ * @return true once the request is in AO_Display's queue.
  */
-static void compose_post(display_compose_ask_t *ask, display_compose_t const *job, uint32_t gen)
+static bool compose_post(display_compose_ask_t *ask, display_compose_t const *job, uint32_t gen)
 {
     DisplayComposeReqEvt * const e = Q_NEW_X(DisplayComposeReqEvt, 0U, DISPLAY_COMPOSE_REQ_SIG);
     bool posted = false;
@@ -112,20 +113,16 @@ static void compose_post(display_compose_ask_t *ask, display_compose_t const *jo
         /* A request that does not fit is recycled by the post itself. */
         posted = QACTIVE_POST_X(AO_Display, &e->super, KQP_DISPLAY_CMD_MARGIN, (void *)0);
     }
-    if ( !posted )
-    {
-        ask->rc = (uint32_t)KODE_NO_RESOURCES;
-        ask->us = 0U;
-        tag_set(&ask->ack, gen);
-        khal_sem_signal(ask->done);
-    }
+    return posted;
 }
 
 /**
  * @brief Wait for the answer to tag @p gen, and for no other.
  *
- * A wait that ran out leaves a signal owed: it wakes the next wait, which
- * finds a foreign tag and goes on for what is left of its own time.
+ * Only a pass that outlived its asker (KODE_IO_ERROR) leaves a signal owed:
+ * it wakes the next wait, which finds a foreign tag and goes on for what is
+ * left of its own time. A request given up before AO_Display took it is
+ * never answered.
  *
  * @param ask        The asker's state.
  * @param gen        The tag.
@@ -180,7 +177,11 @@ kode_status_t display_compose_run(display_compose_ask_t *ask, display_compose_t 
     bool answered;
 
     tag_set(&ask->gen, gen);
-    compose_post(ask, job, gen);
+    if ( !compose_post(ask, job, gen) )
+    {
+        /* No request was made: there is nothing to wait for. */
+        return KODE_NO_RESOURCES;
+    }
     answered = compose_await(ask, gen, timeout_ms);
     if ( !answered )
     {
