@@ -242,6 +242,10 @@ kode_status_t khal_console_dock_release(void)
     if ( s_dock_up )
     {
         s_dock_up = false;
+        /* The CDC port first: tinyusb_driver_uninstall() leaves the port's
+         * object in place, and tinyusb_cdcacm_init() refuses one that is
+         * still there, so the next take would fail. */
+        (void)tinyusb_cdcacm_deinit((int)TINYUSB_CDC_ACM_0);
         (void)tinyusb_driver_uninstall();
     }
     {
