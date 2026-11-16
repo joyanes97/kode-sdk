@@ -6295,9 +6295,12 @@ typedef struct {
  * without AO_Haptic knowing who did - the AUDIO_FILE_RSP_SIG arrangement.
  * @c starved says the RTP FIFO refused a burst at least once during the
  * feed - the chip was ahead of it, not dry - which is the one thing a caller
- * cannot read out of the status code. It is how close a buzz came to the
- * FIFO's own back-pressure, and a buzz that ends KODE_OK with it set played
- * out whole.
+ * cannot read out of the status code. The feed is paced by that refusal, so
+ * every buzz long enough to fill the FIFO to its almost-full mark, about
+ * 75 ms of one, sets it, and a buzz that ends KODE_OK with it set played out
+ * whole. A chip found out of RTP with samples still owed - its FIFO ran
+ * dry - ends the buzz with KODE_IO_ERROR, and @c samples is what it was fed
+ * up to then.
  */
 typedef struct {
     QEvt     super;
