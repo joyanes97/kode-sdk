@@ -35,7 +35,9 @@
 #include "lowpower_cases.h"
 #include "miniz.h"
 #include "qf_support.h"
+#include "radio_knocks.h"
 #include "appmgr_outcome.h"
+#include "esp_private/partition_linux.h"
 
 /**
  * @brief Whether the next appmgr_make() leaves AO_AppMgr listening to the
@@ -78,6 +80,10 @@ static void appmgr_make(void)
     qf_support_give_queue(AO_Net);
     qf_support_give_queue(AO_Boot);
     qf_support_give_queue(AO_Log);
+    /* AO_Radio is played from its queue: the BLE state ask is a knock, which
+     * AO_Radio's initial transition makes on a board before anyone asks, and
+     * which the cases take wherever they read the ask out of that queue. */
+    radio_knocks_reset();
     AO_AppMgr->prio  = KODE_PRIO_APPMGR;
     AO_AppMgr->pthre = KODE_PRIO_APPMGR;
 
@@ -10275,6 +10281,10 @@ static void inst_ble(bool console)
     QASM_DISPATCH(AO_AppMgr, &e.super, 0U);
     while ( xQueueReceive(AO_Radio->eQueue, &q, 0U) == pdTRUE )
     {
+        if ( (QSignal)BLE_STATE_REQ_SIG == q->sig )
+        {
+            (void)radio_knocks_take(RADIO_KNOCK_STATE, NULL);   /* as AO_Radio would */
+        }
         QF_gc(q);
     }
 }
@@ -10542,6 +10552,10 @@ static unsigned radio_requests(enum_t sig)
         if ( (enum_t)e->sig == sig )
         {
             ++n;
+        }
+        if ( (QSignal)BLE_STATE_REQ_SIG == e->sig )
+        {
+            (void)radio_knocks_take(RADIO_KNOCK_STATE, NULL);   /* as AO_Radio would */
         }
         QF_gc(e);
     }
@@ -11463,8 +11477,9 @@ TEST_CASE("a kodeOS update from a URL ends installed and switches",
 
 /* A confirmed line the board itself lost (AO_Log's pool, its queue or the
  * cmd/out ring) is answered not sent while the port stays up: the record is
- * owed again, and goes out the next time the port says it is up. */
-TEST_CASE("a confirmed record the board lost with the port up is owed again",
+ * said again at once, plain, stays owed, and goes out confirmed the next time
+ * the port says it is up. */
+TEST_CASE("a confirmed record the board lost with the port up is said again and owed",
           "[appmgr_ao][install_rec]")
 {
     inst_seed(APPMGR_INST_KEY_APP, 81U, (uint8_t)APPMGR_INST_INSTALLED,
@@ -11478,6 +11493,8 @@ TEST_CASE("a confirmed record the board lost with the port up is owed again",
     unsigned const first = klog_count_of("id=81 ");
     inst_sent((uint8_t)KODE_CONSOLE_SRC_NET, false);   /* lost inside the board */
     appmgr_inst_rec_t const lost = inst_read(APPMGR_INST_KEY_APP);
+    unsigned const at_once = klog_count_of("id=81 ");
+    unsigned const plain   = inst_src_of("id=81 ", "state=installed");
     inst_channel((uint8_t)CHAN_UP);
     unsigned const again = klog_count_of("id=81 ");
     inst_sent((uint8_t)KODE_CONSOLE_SRC_NET, true);
@@ -11486,7 +11503,9 @@ TEST_CASE("a confirmed record the board lost with the port up is owed again",
 
     TEST_ASSERT_EQUAL_UINT(1U, first);
     TEST_ASSERT_EQUAL_UINT8_MESSAGE(0U, lost.told, "a lost line was taken as told");
-    TEST_ASSERT_EQUAL_UINT_MESSAGE(2U, again, "the record did not go out again");
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(2U, at_once, "the lost line was not said again at once");
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(KODE_CONSOLE_SRC_NET, plain, "said again, but not plain");
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(3U, again, "the record did not go out again");
     TEST_ASSERT_EQUAL_UINT8(1U, told.told);
 }
 
@@ -11506,7 +11525,7 @@ TEST_CASE("an answer for an earlier state does not tell the record's new one",
 
     inst_channel((uint8_t)CHAN_UP);                 /* `installed` goes out */
     inst_stable(0x420000U, KBOOT_OTHER_GIVEN_UP);   /* the verdict, while it is out */
-    bool const held = (NULL == inst_line_with("id=70 dst=os", "state=confirmed"));
+    unsigned const plain = inst_src_of("id=70 dst=os", "state=confirmed");
     inst_sent((uint8_t)KODE_CONSOLE_SRC_NET, true); /* the answer for `installed` */
     appmgr_inst_rec_t const after_first = inst_read(APPMGR_INST_KEY_OS);
     unsigned const verdict = inst_src_of("id=70 dst=os", "state=confirmed");
@@ -11514,7 +11533,8 @@ TEST_CASE("an answer for an earlier state does not tell the record's new one",
     appmgr_inst_rec_t const after_second = inst_read(APPMGR_INST_KEY_OS);
     inst_channel((uint8_t)CHAN_OFF);
 
-    TEST_ASSERT_TRUE_MESSAGE(held, "a second confirmed line went out on a busy port");
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(KODE_CONSOLE_SRC_NET, plain,
+        "the verdict behind a busy port was not said plain at once");
     TEST_ASSERT_EQUAL_UINT8(APPMGR_INST_CONFIRMED, after_first.state);
     TEST_ASSERT_EQUAL_UINT8_MESSAGE(0U, after_first.told,
         "the answer for installed told the verdict");
@@ -12772,4 +12792,202 @@ TEST_CASE("a copy the card fills up during is skipped, its temporary removed, an
     path_req_expect((uint8_t)STORAGE_PATH_UNLINK, "/sdcard/first.bin.tmp",
                     "what landed of the copy was left on a full card");
     backup_end();
+}
+
+/**
+ * @brief Install a file app, with the flash refusing every write and erase
+ *        from the point @p late names.
+ * @param late true: once the image is written, so the directory is the
+ *             first write refused; false: before the image's first byte.
+ * @return The app record after it.
+ */
+static appmgr_inst_rec_t install_with_flash_refusing(bool late)
+{
+    uint32_t const len = image_named("new");
+
+    Mockkdrv_slot_Init();
+    undo_fresh();
+    keep_hold_dir();
+    kapps_dir_t empty = *kdrv_apps_dir();
+    empty.count = 0U;
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kdrv_apps_dir_commit(&empty));
+    ask_file_from("new.bin", (uint8_t)KFW_TARGET_APP, (uint8_t)KODE_CONSOLE_SRC_SERIAL);
+    storage_expect(STORAGE_OPEN_REQ_SIG, "the install never asked for its file");
+    answer_open(len, (uint8_t)KDRV_MEDIUM_FS);
+    if ( !late )
+    {
+        esp_partition_fail_after(0U, ESP_PARTITION_FAIL_AFTER_MODE_BOTH);
+    }
+    answer_data(len);
+    if ( late )
+    {
+        esp_partition_fail_after(0U, ESP_PARTITION_FAIL_AFTER_MODE_BOTH);
+    }
+    answer_eof();
+    esp_partition_fail_after(SIZE_MAX, ESP_PARTITION_FAIL_AFTER_MODE_BOTH);
+    appmgr_inst_rec_t const got = inst_read(APPMGR_INST_KEY_APP);
+    keep_end();
+    return got;
+}
+
+/* `write` is the flash refusing a write, the image's or the directory's that
+ * names it; an image that is fine says nothing else. */
+TEST_CASE("a flash that refuses the image or its directory is kept as failed for write",
+          "[appmgr_ao][install_rec]")
+{
+    appmgr_inst_rec_t const early = install_with_flash_refusing(false);
+    appmgr_inst_rec_t const dir   = install_with_flash_refusing(true);
+
+    TEST_ASSERT_EQUAL_UINT8(APPMGR_INST_FAILED, early.state);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(APPMGR_WHY_WRITE, early.why, "the image's write");
+    TEST_ASSERT_EQUAL_UINT8(APPMGR_INST_FAILED, dir.state);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(APPMGR_WHY_WRITE, dir.why, "the directory's write");
+}
+
+/* ---- Two installs whose finals cross on one port --------------------------- */
+
+/**
+ * @brief A URL install of an app asked on @p asker, cancelled before it
+ *        opens: its final record, `failed why=cancelled`, comes at once.
+ * @param asker KODE_CONSOLE_SRC_*, or KODE_LOG_SRC_NONE for the glass.
+ * @return The record's id.
+ */
+static uint32_t inst_cancelled_from(uint8_t asker)
+{
+    static const QEvt cancel = QEVT_INITIALIZER(APP_CANCEL_REQ_SIG);
+    FlashReqEvt       e;
+
+    (void)memset(&e, 0, sizeof(e));
+    e.super     = (QEvt)QEVT_INITIALIZER(FLASH_REQ_SIG);
+    e.src_kind  = (uint8_t)KFW_SRC_HTTP;
+    e.dst_kind  = (uint8_t)KFW_TARGET_APP;
+    e.asker_src = asker;
+    e.who       = ao_spy();
+    (void)snprintf(e.src, sizeof(e.src), "%s", "https://example.com/notes.bin");
+    QASM_DISPATCH(AO_AppMgr, &e.super, 0U);
+    if ( (uint8_t)KODE_CONSOLE_SRC_NET == asker )
+    {
+        inst_channel((uint8_t)CHAN_UP);   /* AO_Net's answer to the ask at the take */
+    }
+    else if ( (uint8_t)KODE_CONSOLE_SRC_BLE == asker )
+    {
+        inst_ble(true);                   /* AO_Radio's */
+    }
+    else
+    {
+        /* The glass asks nobody. */
+    }
+    QASM_DISPATCH(AO_AppMgr, &cancel, 0U);
+    (void)net_requests(NET_STREAM_OPEN_REQ_SIG);
+    (void)net_requests(CHANNEL_STATE_REQ_SIG);
+    (void)radio_requests(BLE_STATE_REQ_SIG);
+    ao_spy_drain();
+    return inst_read(APPMGR_INST_KEY_APP).id;
+}
+
+/** @brief Start the crossing cases: no record, both ports' owners with a queue. */
+static void cross_begin(void)
+{
+    appmgr_fresh();
+    qf_support_give_queue(AO_Radio);
+    qf_support_give_queue(AO_Net);
+    (void)net_requests(CHANNEL_STATE_REQ_SIG);
+    (void)radio_requests(BLE_STATE_REQ_SIG);
+    ao_spy_drain();
+    fake_klog_reset();
+}
+
+/** @brief End the crossing cases: both ports down, nothing left armed. */
+static void cross_end(void)
+{
+    inst_ble(false);
+    inst_channel((uint8_t)CHAN_OFF);
+    (void)net_requests(CHANNEL_STATE_REQ_SIG);
+    run_ticks(2U);
+}
+
+/* A's final goes out confirmed on BLE and its answer is awaited. B, from the
+ * glass, takes the app's record before that answer comes. The answer still
+ * belongs to A: the next install on BLE, C, says its own final confirmed and
+ * is told by its own answer. */
+TEST_CASE("an answer still due when another install takes the record holds up "
+          "no later final", "[appmgr_ao][install_rec]")
+{
+    char kv[24];
+
+    cross_begin();
+    inst_ble(true);
+    uint32_t const a = inst_cancelled_from((uint8_t)KODE_CONSOLE_SRC_BLE);
+    (void)snprintf(kv, sizeof(kv), "id=%lu ", (unsigned long)a);
+    unsigned const a_src = inst_src_of(kv, "why=cancelled");
+
+    (void)inst_cancelled_from((uint8_t)KODE_LOG_SRC_NONE);
+    inst_sent((uint8_t)KODE_CONSOLE_SRC_BLE, true);   /* A's answer, late */
+
+    uint32_t const c = inst_cancelled_from((uint8_t)KODE_CONSOLE_SRC_BLE);
+    (void)snprintf(kv, sizeof(kv), "id=%lu ", (unsigned long)c);
+    unsigned const c_src = inst_src_of(kv, "why=cancelled");
+    inst_sent((uint8_t)KODE_CONSOLE_SRC_BLE, true);
+    appmgr_inst_rec_t const got = inst_read(APPMGR_INST_KEY_APP);
+    cross_end();
+
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(KODE_CONSOLE_SRC_BLE | KODE_LOG_SRC_CONFIRM, a_src,
+        "A's final did not go out confirmed");
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(KODE_CONSOLE_SRC_BLE | KODE_LOG_SRC_CONFIRM, c_src,
+        "C's final waited on an answer that was A's");
+    TEST_ASSERT_EQUAL_UINT32(c, got.id);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(1U, got.told, "C's own answer did not tell it");
+}
+
+/* The PUBACK for A's final (a kodeOS update's) never reaches AO_Net, and the
+ * channel stays up. B, an app, ends behind it on the same port: its final is
+ * said at once, plain, and stays owed. The store hears both with no clock of
+ * its own. */
+TEST_CASE("a final behind a line whose PUBACK was lost is said at once",
+          "[appmgr_ao][install_rec]")
+{
+    char b_kv[24];
+
+    inst_seed(APPMGR_INST_KEY_OS, 91U, (uint8_t)APPMGR_INST_FAILED,
+              (uint8_t)APPMGR_WHY_CUT, (uint8_t)KODE_CONSOLE_SRC_NET);
+    inst_seed(APPMGR_INST_KEY_APP, 0U, (uint8_t)APPMGR_INST_NONE,
+              (uint8_t)APPMGR_WHY_NONE, (uint8_t)KODE_CONSOLE_SRC_SERIAL);
+    cross_begin();
+    inst_channel((uint8_t)CHAN_UP);   /* A goes out confirmed; its PUBACK is lost */
+    unsigned const a_src = inst_src_of("id=91 ", "why=cut");
+    uint32_t const b = inst_cancelled_from((uint8_t)KODE_CONSOLE_SRC_NET);
+    (void)snprintf(b_kv, sizeof(b_kv), "id=%lu ", (unsigned long)b);
+    unsigned const b_src  = inst_src_of(b_kv, "why=cancelled");
+    uint8_t const  b_told = inst_read(APPMGR_INST_KEY_APP).told;
+    cross_end();
+
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(KODE_CONSOLE_SRC_NET | KODE_LOG_SRC_CONFIRM, a_src,
+        "A's final did not go out confirmed");
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(KODE_CONSOLE_SRC_NET, b_src,
+        "B's final was kept silent behind A's line");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(0U, b_told, "a plain line is not known delivered");
+}
+
+/* A's final is owed to the channel, which is down. B, from the glass, takes
+ * the app's record before the channel comes back: one record per kind, so A
+ * is never said, and the channel hears B's alone. */
+TEST_CASE("an owed final that another install of its kind replaces is never said",
+          "[appmgr_ao][install_rec]")
+{
+    char b_kv[24];
+
+    inst_seed(APPMGR_INST_KEY_APP, 91U, (uint8_t)APPMGR_INST_FAILED,
+              (uint8_t)APPMGR_WHY_CUT, (uint8_t)KODE_CONSOLE_SRC_NET);
+    cross_begin();
+    uint32_t const b = inst_cancelled_from((uint8_t)KODE_LOG_SRC_NONE);
+    (void)snprintf(b_kv, sizeof(b_kv), "id=%lu ", (unsigned long)b);
+    fake_klog_reset();
+    inst_channel((uint8_t)CHAN_UP);
+    const char * const a_line = inst_line_with("id=91 ", "why=cut");
+    appmgr_inst_rec_t const got = inst_read(APPMGR_INST_KEY_APP);
+    cross_end();
+
+    TEST_ASSERT_NULL_MESSAGE(a_line, "a replaced record was said");
+    TEST_ASSERT_EQUAL_UINT32(b, got.id);
+    TEST_ASSERT_NOT_EQUAL_UINT32(91U, b);
 }
