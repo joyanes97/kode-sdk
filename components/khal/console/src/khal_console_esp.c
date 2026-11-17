@@ -15,6 +15,8 @@
 #if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
+#include "hal/usb_serial_jtag_ll.h"
+#include "soc/usb_serial_jtag_struct.h"
 #elif defined(CONFIG_ESP_CONSOLE_UART)
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
@@ -38,9 +40,8 @@
 #define READER_STACK        4096U   /**< Reader task stack, bytes. */
 #define READER_TIMEOUT_MS   50U     /**< Longest wait before the reader looks for a raw-mode request. */
 #define READER_DRAIN_CHUNK  64U     /**< Bytes read per pass when discarding input before raw mode. */
-#define READER_REST_MS      1000U   /**< The same wait while the board sleeps: khal_console_rest(). */
 
-static volatile bool s_reader_rest;   /**< The board sleeps: the reader looks up once a second. */
+static volatile bool s_reader_rest;   /**< The board sleeps: the reader looks up every KHAL_CONSOLE_REST_MS. */
 
 /* ---- The dock port (CONFIG_KHAL_CONSOLE_DOCK): a TinyUSB CDC-ACM on GPIO26/27 ---- */
 #if defined(CONFIG_KHAL_CONSOLE_DOCK)
@@ -628,7 +629,7 @@ static void khal_reader_task(void *pv)
         uint32_t wait_ms = READER_TIMEOUT_MS;
         if ( s_reader_rest )
         {
-            wait_ms = READER_REST_MS;
+            wait_ms = KHAL_CONSOLE_REST_MS;
         }
         int32_t const c = console_getc(wait_ms);
         if ( 0 > c )
@@ -669,6 +670,35 @@ void khal_console_raw_end(void)
 void khal_console_rest(bool rest)
 {
     s_reader_rest = rest;
+}
+
+kode_status_t khal_console_frame(uint32_t *frame)
+{
+    kode_status_t rc = KODE_DENIED;
+
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    if ( NULL != frame )
+    {
+        *frame = USB_SERIAL_JTAG.fram_num.serial_jtag_sof_frame_index;
+        rc     = KODE_OK;
+    }
+#else
+    (void)frame;
+#endif
+    return rc;
+}
+
+kode_status_t khal_console_pad(bool on)
+{
+    kode_status_t rc = KODE_DENIED;
+
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    usb_serial_jtag_ll_phy_enable_pad(on);
+    rc = KODE_OK;
+#else
+    (void)on;
+#endif
+    return rc;
 }
 
 kode_status_t khal_console_start_reader(void (*on_byte)(uint8_t byte), uint32_t prio)

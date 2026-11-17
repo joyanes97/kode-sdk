@@ -270,6 +270,9 @@ typedef struct {
     uint8_t     part_late_who[PART_COUNT]; /**< By the part's bit: the participant that owes its answer. */
     bool        part_pin_free;    /**< The header's position was free, not an input, before it was armed. */
     khal_gpio_pull_t part_pin_pulled; /**< The pull that input had: it gets it back. */
+    bool        cable_check;      /**< The board woke from ASLEEP or the CPU part's rest, and AWAKE has had
+                                   *   no reading since: a cable in that reading came while the cable port
+                                   *   was off the bus. */
 } LowPower;
 
 static LowPower l_lowpower;
@@ -610,7 +613,103 @@ static bool state_retry_fire(LowPower * const me)
 }
 
 
+/* ---- The look for a cable ------------------------------------------------------- */
+
+_Static_assert(KODE_LOWPOWER_CABLE_LOOK_MS >= KHAL_CONSOLE_REST_MS,
+               "the look runs at the console reader's wakes: a shorter period would be the reader's, not its own");
+
+/**
+ * @brief Runs in the timer task: ask AO_Power whether a cable is in.
+ *
+ * AO_Power reads one register and publishes a whole reading only when the
+ * cable came or went; one with a cable in it wakes the board (POWER_EVT_SIG in
+ * LowPower_asleep) or ends the CPU part's rest (part_wake_cause()). A request
+ * AO_Power's queue has no room for is dropped: the next look asks again.
+ *
+ * @param arg Unused.
+ */
+static void cable_look_due_cb(void *arg)
+{
+    (void)arg;
+    (void)power_cable_request();
+}
+
+/**
+ * @brief Begin or end the look for a cable while the P4 sleeps.
+ *
+ * No line of the board wakes the P4 for a cable, and every light sleep takes
+ * the cable port off the bus, in ASLEEP and in the CPU part's rest alike: a
+ * host that plugs in then is not answered and gives the port up. From the
+ * moment the lock is let go until the P4 is awake for good (a dark wake keeps
+ * the look), AO_Power is asked whether a cable is in every
+ * KODE_LOWPOWER_CABLE_LOOK_MS. The timer does not wake the P4 by itself: it
+ * runs at the first wake after it is due, and the console reader wakes the P4
+ * every KHAL_CONSOLE_REST_MS while it sleeps (khal_console_rest()), so a cable
+ * is seen within KODE_LOWPOWER_CABLE_LOOK_MS + KHAL_CONSOLE_REST_MS. It is a
+ * periodic timer of its own, so the minute keeps every one-shot.
+ *
+ * @param on true when the lock is let go, false when it is taken again.
+ */
+static void cable_look(bool on)
+{
+    static bool s_cable_timer;   /* The periodic timer exists: khal_timer_periodic() took it. */
+
+    if ( s_cable_timer )
+    {
+        if ( khal_timer_periodic_run(&cable_look_due_cb, on) != KODE_OK )
+        {
+            KLOG_W(TAG, "the look for a cable would not change");
+        }
+    }
+    else if ( on )
+    {
+        if ( khal_timer_periodic(&cable_look_due_cb, NULL,
+                                 (uint64_t)KODE_LOWPOWER_CABLE_LOOK_MS * US_PER_MS) == KODE_OK )
+        {
+            s_cable_timer = true;
+        }
+        else
+        {
+            KLOG_W(TAG, "the look for a cable would not start; the minute's reading finds a cable");
+        }
+    }
+    else
+    {
+        /* Never started: nothing to stop. */
+    }
+}
+
+/**
+ * @brief A cable came while the cable port was off the bus: ask AO_Log, the
+ *        console's owner, to show the port to the host again.
+ *
+ * A request AO_Log's queue has no room for is said here: the host that gave
+ * the port up keeps it given up until the cable is plugged in again.
+ */
+static void cable_port_show(void)
+{
+    if ( !log_bounce_request() )
+    {
+        KLOG_W(TAG, "AO_Log's queue is full: the cable port is not shown to the host again");
+    }
+}
+
 /* ---- The way down ------------------------------------------------------------- */
+
+/**
+ * @brief The tick, then the look for a cable, then the lock: what ASLEEP and
+ *        the CPU part's rest let go of.
+ *
+ * Every owner asked has answered ready, so none is inside an event while the
+ * tick is stopped. light_up() takes back all of it.
+ */
+static void light_down(void)
+{
+    kqp_tick_rest(true);
+    khal_console_rest(true);
+    cable_look(true);
+    khal_power_hold(false);
+}
 
 /**
  * @brief Every participant said ready: change the state.
@@ -638,9 +737,7 @@ static QState round_done(LowPower * const me)
                cause_name(me->cause));
         /* After the lines above are published, and the tick before the lock.
          * Every owner has answered ready: no AO is inside an event while the tick is stopped. */
-        kqp_tick_rest(true);
-        khal_console_rest(true);
-        khal_power_hold(false);
+        light_down();
         status = Q_TRAN(&LowPower_asleep);
     }
     else
@@ -1114,19 +1211,31 @@ static void summary_close(LowPower * const me, uint8_t cause)
 
 /* ---- The way up ----------------------------------------------------------------- */
 
-/** @brief The tick, then the lock: what the P4 needs before anything else runs. */
-static void light_up(void)
+/**
+ * @brief The tick, then the lock: what the P4 needs before anything else runs.
+ *
+ * The look for a cable is left as it is: a dark wake keeps it (dark_enter()).
+ */
+static void light_hold(void)
 {
     kqp_tick_rest(false);
     khal_console_rest(false);
     khal_power_hold(true);
 }
 
+/** @brief The tick, then the lock, and no more look for a cable: the P4 is awake for good. */
+static void light_up(void)
+{
+    light_hold();
+    cable_look(false);
+}
+
 /**
  * @brief A dark wake is over, one way or another: forget what it counted.
  *
- * The tick and the lock are the caller's to settle. The round's one-shot is
- * stopped only when this wake's own round is the one it times.
+ * The tick, the lock and the look for a cable are the caller's to settle. The
+ * round's one-shot is stopped only when this wake's own round is the one it
+ * times.
  *
  * @param me The AO.
  */
@@ -1145,9 +1254,10 @@ static void dark_clear(LowPower * const me)
 }
 
 /**
- * @brief Have the tick and the lock back, from either phase of ASLEEP.
+ * @brief Have the tick and the lock back, from either phase of ASLEEP, and end
+ *        the look for a cable.
  *
- * A dark wake has them already.
+ * A dark wake has the tick and the lock already, and kept the look.
  *
  * @param me The AO, ASLEEP.
  */
@@ -1156,6 +1266,7 @@ static void rest_up(LowPower * const me)
     if ( me->dark )
     {
         dark_clear(me);
+        cable_look(false);
     }
     else
     {
@@ -1182,6 +1293,7 @@ static void wake_up(LowPower * const me, uint8_t cause)
     /* An owner's time is nobody at the board; every other wake is somebody. */
     me->used    = ((uint8_t)KODE_LP_CAUSE_TIMER != cause);
     me->rest_on = false;
+    me->cable_check = true;
     if ( (LP_CAUSES > cause) && (!counted) )
     {
         me->wakes[cause] += 1U;
@@ -1804,11 +1916,15 @@ static QState dark_begin(LowPower * const me, uint64_t now)
 /**
  * @brief Entering the dark wake: the tick, the lock, then the news.
  *
+ * The look for a cable goes on: AO_Power is at rest and polls nothing, and a
+ * cable that comes now must still wake the board whole (POWER_EVT_SIG in
+ * LowPower_asleep), not wait for the wake to end.
+ *
  * @param me The AO, ASLEEP.
  */
 static void dark_enter(LowPower * const me)
 {
-    light_up();
+    light_hold();
     me->dark          = true;
     me->dark_resting  = false;
     me->dark_closing  = false;
@@ -1941,9 +2057,7 @@ static QState dark_release(LowPower * const me)
     dark_clear(me);
     KLOG_N(TAG, "dark wake done: ASLEEP again, the glass was not lit");
     wake_fold(me);   /* a time the owners gave in the round */
-    kqp_tick_rest(true);
-    khal_console_rest(true);
-    khal_power_hold(false);
+    light_down();
     return Q_TRAN(&LowPower_asleep);
 }
 
@@ -2694,11 +2808,15 @@ static void part_cpu_restore(LowPower * const me)
 /**
  * @brief End the CPU part: the tick and the lock back, the wake sources let go.
  *
+ * A cable in the first reading after this came while the cable port was off
+ * the bus, as after ASLEEP (POWER_EVT_SIG in LowPower_awake).
+ *
  * @param me The AO, with the CPU part at rest.
  */
 static void part_cpu_up(LowPower * const me)
 {
     light_up();
+    me->cable_check = true;
     part_wakes_off(me);
     me->part_rest &= (uint8_t)~KODE_LP_PART_CPU;
     part_cpu_restore(me);
@@ -2737,8 +2855,9 @@ static void part_cpu_wake(LowPower * const me, uint8_t cause)
  * @brief The sequence in hand is over: answer it, and let the P4 sleep if it asked.
  *
  * The answer goes out before the tick stops and the lock goes (rule 6). A
- * sleeping P4 keeps the minute ASLEEP keeps: it is what reads the charger,
- * counts off_after and serves an owner's time (part_minute()).
+ * sleeping P4 keeps what ASLEEP keeps: the minute, which reads the charger,
+ * counts off_after and serves an owner's time (part_minute()), and the look
+ * for a cable (light_down()).
  *
  * @param me  The AO.
  * @param rc  KODE_OK when every part is as asked.
@@ -2777,9 +2896,7 @@ static void part_finish(LowPower * const me, kode_status_t rc, const char *why)
                (unsigned)me->part_after_ms);
         me->part_since_us = now;
         minute_schedule(me, now, me->part_since_us);
-        kqp_tick_rest(true);
-        khal_console_rest(true);
-        khal_power_hold(false);
+        light_down();
     }
 }
 
@@ -3730,8 +3847,9 @@ static uint32_t part_round_keep(LowPower * const me)
  * no settle runs and AO_Buttons publishes nothing. A touch does when the app
  * asked for it. Everything that needs the system's clock to be served does:
  * a console line, an MQTT message, a cable, a cell at its cut and any request
- * to this AO. The cable and the cell show in the reading the minute asks for
- * (part_minute()).
+ * to this AO. A cable shows in the reading AO_Power publishes when the look
+ * for a cable finds it come (cable_look()), and the cell and the cable both
+ * in the one the minute asks for (part_minute()).
  *
  * @param me The AO, AWAKE, with the CPU part at rest.
  * @param e  The event.
@@ -4166,11 +4284,20 @@ static QState LowPower_awake(LowPower * const me, QEvt const * const e)
             break;
         }
         case POWER_EVT_SIG: {
+            bool const plugged = Q_EVT_CAST(PowerEvt)->vbus && (!me->vbus);
+
             /* A cable that appears is somebody at the board. */
-            if ( Q_EVT_CAST(PowerEvt)->vbus && (!me->vbus) )
+            if ( plugged )
             {
                 me->used = true;
             }
+            if ( plugged && me->cable_check )
+            {
+                /* It came while the P4 slept, and a host on it may have
+                 * given the cable port up. */
+                cable_port_show();
+            }
+            me->cable_check = false;
             me->vbus = Q_EVT_CAST(PowerEvt)->vbus;
             if ( me->retry_on && me->vbus )
             {
@@ -4423,6 +4550,9 @@ static QState LowPower_asleep(LowPower * const me, QEvt const * const e)
             if ( me->vbus )
             {
                 wake_up(me, (uint8_t)KODE_LP_CAUSE_VBUS);
+                /* The cable came while the cable port was off the bus; the
+                 * tick runs again for AO_Log's waits. */
+                cable_port_show();
                 status = Q_TRAN(&LowPower_awake);
             }
             else
@@ -4642,6 +4772,7 @@ void LowPower_ctor(void)
     me->round_src = (uint8_t)KODE_LOG_SRC_NONE;
     me->power_ok = false;
     me->vbus     = false;
+    me->cable_check = false;
     for ( uint8_t i = 0U; (uint8_t)SETTING_COUNT > i; i++ )
     {
         me->secs[i] = SETTINGS[i].def_s;

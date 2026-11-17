@@ -5319,3 +5319,381 @@ TEST_CASE("kode_rest is refused inside an Active Object, which is named, and pos
                                    "a request was posted all the same");
     task_rest_down();
 }
+
+/* ---- The look for a cable ------------------------------------------------------------ */
+
+/** @brief The period of the look for a cable, microseconds. */
+#define LOOK_US  ((uint64_t)KODE_LOWPOWER_CABLE_LOOK_MS * 1000ULL)
+
+/** @brief How many requests to show the cable port again AO_Log was posted; its queue is emptied. */
+static unsigned bounces(void)
+{
+    return queued(AO_Log, LOG_BOUNCE_REQ_SIG);
+}
+
+/**
+ * @brief Empty AO_Power's queue, counting what was asked of it.
+ * @param peeks Receives how many whole readings were asked (POWER_PEEK_REQ_SIG).
+ * @return How many looks for a cable alone were asked (POWER_CABLE_REQ_SIG).
+ */
+static unsigned cable_looks(unsigned *peeks)
+{
+    const QEvt *e = NULL;
+    unsigned    looks = 0U;
+
+    *peeks = 0U;
+    while ( xQueueReceive(AO_Power->eQueue, &e, 0U) == pdTRUE )
+    {
+        if ( (QSignal)POWER_CABLE_REQ_SIG == e->sig )
+        {
+            looks++;
+        }
+        else if ( (QSignal)POWER_PEEK_REQ_SIG == e->sig )
+        {
+            (*peeks)++;
+        }
+        else
+        {
+            /* Not what this counts. */
+        }
+        QF_gc(e);
+    }
+    return looks;
+}
+
+/** @brief Fire the look's timer once and check it asked AO_Power for the cable alone. */
+static void look_fires_once(void)
+{
+    unsigned peeks = 0U;
+
+    TEST_ASSERT_TRUE(fake_time_periodic_fire_at(LOOK_US));
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1U, cable_looks(&peeks), "the look asks whether a cable is in");
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, peeks, "the look asks for no whole reading");
+}
+
+TEST_CASE("asleep, the charger is read every few seconds on a timer of its own; awake, it is not",
+          "[lowpower_ao]")
+{
+    lp_up(KODE_OK);
+    go_asleep();
+    (void)queued(AO_Power, POWER_PEEK_REQ_SIG);
+
+    TEST_ASSERT_TRUE_MESSAGE(fake_time_periodic_running_at(LOOK_US), "asleep, the look runs");
+    TEST_ASSERT_FALSE_MESSAGE(fake_time_periodic_running(), "and the tick does not");
+    look_fires_once();
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1U, fake_time_once_pending(), "the minute's one-shot is the only one");
+
+    expander(LEVELS_BOT, CHANGED_BOT);
+    expect_state(KODE_LP_AWAKE, KODE_LP_CAUSE_BOT, KODE_LP_ASLEEP);
+    TEST_ASSERT_FALSE_MESSAGE(fake_time_periodic_running_at(LOOK_US),
+                              "awake, AO_Power polls the charger by itself");
+    lp_down();
+}
+
+TEST_CASE("a cable the look finds wakes the board and has the cable port shown again, once",
+          "[lowpower_ao]")
+{
+    lp_up(KODE_OK);
+    go_asleep();
+    (void)bounces();
+
+    charger_reading(false);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, ao_spy_count(), "no cable, no wake");
+    TEST_ASSERT_EQUAL_UINT(0U, bounces());
+
+    charger_reading(true);
+    expect_state(KODE_LP_AWAKE, KODE_LP_CAUSE_VBUS, KODE_LP_ASLEEP);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1U, bounces(), "the port was off the bus when the cable came");
+    TEST_ASSERT_FALSE(fake_time_periodic_running_at(LOOK_US));
+
+    charger_reading(true);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, bounces(), "once for one cable");
+    lp_down();
+}
+
+TEST_CASE("a cable in the first reading after another wake has the cable port shown again",
+          "[lowpower_ao]")
+{
+    lp_up(KODE_OK);
+    go_asleep();
+    expander(LEVELS_BOT, CHANGED_BOT);
+    expect_state(KODE_LP_AWAKE, KODE_LP_CAUSE_BOT, KODE_LP_ASLEEP);
+    (void)bounces();
+
+    charger_reading(true);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1U, bounces(), "the cable came before the look saw it");
+    lp_down();
+}
+
+TEST_CASE("a cable that comes to a board that is awake leaves the cable port alone",
+          "[lowpower_ao]")
+{
+    lp_up(KODE_OK);
+    (void)bounces();
+    charger_reading(true);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, bounces(), "the board never slept");
+    charger_reading(false);
+
+    go_asleep();
+    expander(LEVELS_BOT, CHANGED_BOT);
+    expect_state(KODE_LP_AWAKE, KODE_LP_CAUSE_BOT, KODE_LP_ASLEEP);
+    charger_reading(false);
+    charger_reading(true);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, bounces(),
+                                   "the reading after the wake had no cable: the port was on the bus");
+    lp_down();
+}
+
+/** @brief Leave ASLEEP by the top button. */
+static void leave_by_top(void)
+{
+    static const QEvt top = QEVT_INITIALIZER(LOWPOWER_TOP_SIG);
+
+    feed(&top);
+    expect_state(KODE_LP_AWAKE, KODE_LP_CAUSE_TOP, KODE_LP_ASLEEP);
+}
+
+/** @brief Leave ASLEEP by a message from the broker. */
+static void leave_by_message(void)
+{
+    MqttMsgEvt m;
+
+    (void)memset(&m, 0, sizeof(m));
+    m.super = (QEvt)QEVT_INITIALIZER(MQTT_MSG_SIG);
+    feed(&m.super);
+    expect_state(KODE_LP_AWAKE, KODE_LP_CAUSE_MQTT, KODE_LP_ASLEEP);
+}
+
+/** @brief Leave ASLEEP by a console line. */
+static void leave_by_line(void)
+{
+    console_line(KODE_CONSOLE_SRC_BLE);
+    expect_state(KODE_LP_AWAKE, KODE_LP_CAUSE_BLE, KODE_LP_ASLEEP);
+}
+
+/** @brief Leave ASLEEP for an owner's time. */
+static void leave_by_owner_time(void)
+{
+    wake_in(0U, 10U * SECOND_MS);
+    fire_one_shot();
+    expect_timer_wake();
+}
+
+/** @brief The round for OFF that leaving ASLEEP began: both owners ready, then OFF. */
+static void leave_to_off(kode_lp_cause_t cause)
+{
+    uint32_t const round = expect_round(KODE_LP_OFF);
+
+    say_ready(0U, round, false, NULL);
+    say_ready(1U, round, false, NULL);
+    expect_state(KODE_LP_OFF, cause, KODE_LP_ASLEEP);
+    wait_ms(KODE_LOWPOWER_OFF_GRACE_MS + 10U);
+}
+
+/** @brief Leave ASLEEP for OFF at the minute that reaches off_after (an hour). */
+static void leave_by_off_after(void)
+{
+    for ( unsigned minutes = 0U; (ao_spy_count() == 0U) && (100U > minutes); minutes++ )
+    {
+        fire_one_shot();
+        (void)queued(AO_Display, DISPLAY_MINUTE_REQ_SIG);
+        (void)queued(AO_Power, POWER_PEEK_REQ_SIG);
+    }
+    leave_to_off(KODE_LP_CAUSE_OFF_AFTER);
+}
+
+/** @brief Leave ASLEEP for OFF on request. */
+static void leave_by_off_request(void)
+{
+    ask(KODE_LP_OFF);
+    leave_to_off(KODE_LP_CAUSE_REQUEST);
+}
+
+/** @brief Leave ASLEEP for AWAKE on request. */
+static void leave_by_awake_request(void)
+{
+    ask(KODE_LP_AWAKE);
+    expect_state(KODE_LP_AWAKE, KODE_LP_CAUSE_REQUEST, KODE_LP_ASLEEP);
+}
+
+/* BOT and a cable have their cases above; these are the rest of ASLEEP's ways
+ * out, each of which takes the lock back. */
+TEST_CASE("every other way out of ASLEEP ends the look for a cable", "[lowpower_ao]")
+{
+    static const struct {
+        const char *name;
+        void      (*leave)(void);
+    } ways[] = {
+        { "the top button",       &leave_by_top },
+        { "a broker's message",   &leave_by_message },
+        { "a console line",       &leave_by_line },
+        { "an owner's time",      &leave_by_owner_time },
+        { "off_after",            &leave_by_off_after },
+        { "a request for OFF",    &leave_by_off_request },
+        { "a request for AWAKE",  &leave_by_awake_request },
+    };
+
+    for ( size_t i = 0U; Q_DIM(ways) > i; i++ )
+    {
+        lp_up(KODE_OK);
+        set_word(KSET_KEY_OFF_AFTER, WORD_1H);
+        go_asleep();
+        (void)queued(AO_Display, DISPLAY_MINUTE_REQ_SIG);
+        (void)queued(AO_Power, POWER_PEEK_REQ_SIG);
+        TEST_ASSERT_TRUE_MESSAGE(fake_time_periodic_running_at(LOOK_US), ways[i].name);
+
+        ways[i].leave();
+        TEST_ASSERT_FALSE_MESSAGE(fake_time_periodic_running_at(LOOK_US), ways[i].name);
+        lp_down();
+    }
+}
+
+/* khal_timer_periodic() makes a new timer at every call: one made again for
+ * the same callback would leave the first running where nothing stops it. */
+TEST_CASE("two sleeps make the look's timer once", "[lowpower_ao]")
+{
+    lp_up(KODE_OK);
+    go_asleep();
+    expander(LEVELS_BOT, CHANGED_BOT);
+    expect_state(KODE_LP_AWAKE, KODE_LP_CAUSE_BOT, KODE_LP_ASLEEP);
+
+    sleep_now();
+    TEST_ASSERT_TRUE(fake_time_periodic_running_at(LOOK_US));
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1U, fake_time_periodic_made_at(LOOK_US),
+                                   "the second sleep started the timer again; it made none");
+    lp_down();
+}
+
+/* AO_Power is at rest through a dark wake and polls nothing: the look is the
+ * only reading of the charger there is. */
+TEST_CASE("a dark wake keeps the look, and it runs on after", "[lowpower_ao]")
+{
+    lp_up(KODE_OK);
+    radio_asleep(20U * SECOND_MS);
+    TEST_ASSERT_TRUE(fake_time_periodic_running_at(LOOK_US));
+
+    dark_wake();
+    TEST_ASSERT_TRUE_MESSAGE(fake_time_periodic_running_at(LOOK_US), "a cable must still be seen");
+    (void)queued(AO_Power, POWER_CABLE_REQ_SIG);
+    look_fires_once();
+
+    dark_done_all();
+    dark_rest_both(expect_dark_rounds(), 0U);
+    expect_state(KODE_LP_ASLEEP, KODE_LP_CAUSE_TIMER, KODE_LP_DARK);
+    TEST_ASSERT_TRUE_MESSAGE(fake_time_periodic_running_at(LOOK_US), "the lock is let go again");
+    lp_down();
+}
+
+TEST_CASE("a cable the look finds in a dark wake wakes the board whole, and the look ends",
+          "[lowpower_ao]")
+{
+    lp_up(KODE_OK);
+    radio_asleep(20U * SECOND_MS);
+    dark_wake();
+    (void)bounces();
+
+    charger_reading(true);
+    expect_state(KODE_LP_AWAKE, KODE_LP_CAUSE_VBUS, KODE_LP_ASLEEP);
+    TEST_ASSERT_EQUAL_UINT(1U, bounces());
+    TEST_ASSERT_FALSE_MESSAGE(fake_time_periodic_running_at(LOOK_US), "awake for good: no look");
+    ao_spy_drain();
+    lp_down();
+}
+
+/* The CPU part lets go of the lock as ASLEEP does, so its light sleeps take
+ * the cable port off the bus as well. */
+TEST_CASE("the CPU part's rest reads the charger every few seconds, and its end stops the look",
+          "[lowpower_ao]")
+{
+    lowpower_part_req_t req = { 0 };
+
+    /* The look's timer outlives a case: a first rest and its end leave it
+     * stopped whatever the case before left, so the second rest proves the start. */
+    rest_up();
+    cpu_rest(req);
+    expander(LEVELS_PAD_UP, CHANGED_PAD_UP);
+    TEST_ASSERT_EQUAL_UINT(1U, s_hold_true);
+    TEST_ASSERT_FALSE_MESSAGE(fake_time_periodic_running_at(LOOK_US), "the lock is back: no look");
+    ao_spy_drain();
+
+    req.parts = KODE_LP_PART_CPU;
+    rest_post(&req);
+    say_ready(PART_WHO_IOEXP, expect_part_round(KODE_LP_PART_CPU), false, NULL);
+    (void)expect_news(KODE_LP_PART_ANSWER, KODE_OK, KODE_LP_PART_SCREEN | KODE_LP_PART_CPU);
+    TEST_ASSERT_EQUAL_UINT(2U, s_hold_false);
+    (void)queued(AO_Power, POWER_PEEK_REQ_SIG);
+
+    TEST_ASSERT_TRUE_MESSAGE(fake_time_periodic_running_at(LOOK_US), "with the lock let go, the look runs");
+    TEST_ASSERT_FALSE_MESSAGE(fake_time_periodic_running(), "and the tick does not");
+    look_fires_once();
+
+    expander(LEVELS_PAD_UP, CHANGED_PAD_UP);
+    TEST_ASSERT_EQUAL_UINT(2U, s_hold_true);
+    TEST_ASSERT_FALSE_MESSAGE(fake_time_periodic_running_at(LOOK_US), "the lock is back: no look");
+    lp_down();
+}
+
+TEST_CASE("a cable the look finds ends the CPU part and has the cable port shown again, once",
+          "[lowpower_ao]")
+{
+    lowpower_part_req_t const req = { 0 };
+    const LowPowerPartEvt *n;
+
+    rest_up();
+    cpu_rest(req);
+    ao_spy_drain();
+    (void)bounces();
+
+    charger_reading(false);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, s_hold_true, "no cable, no wake");
+    TEST_ASSERT_EQUAL_UINT(0U, bounces());
+
+    charger_reading(true);
+    TEST_ASSERT_EQUAL_UINT(1U, s_hold_true);
+    expect_awake_posted();
+    n = expect_news(KODE_LP_PART_WOKE, KODE_OK, KODE_LP_PART_SCREEN);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)KODE_LP_WAKE_CABLE, n->cause);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1U, bounces(), "the port was off the bus when the cable came");
+    TEST_ASSERT_FALSE(fake_time_periodic_running_at(LOOK_US));
+
+    charger_reading(true);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, bounces(), "once for one cable");
+    lp_down();
+}
+
+TEST_CASE("a cable in the first reading after the CPU part ended another way has the cable port shown again",
+          "[lowpower_ao]")
+{
+    lowpower_part_req_t const req = { 0 };
+
+    rest_up();
+    cpu_rest(req);
+    ao_spy_drain();
+    expander(LEVELS_PAD_UP, CHANGED_PAD_UP);
+    TEST_ASSERT_EQUAL_UINT(1U, s_hold_true);
+    (void)bounces();
+
+    charger_reading(true);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1U, bounces(), "the cable came before the look saw it");
+    lp_down();
+}
+
+/* The request is posted with a margin; AO_Log's queue without room for it
+ * refuses it, and the refusal is said by AO_LowPower, never asserted. */
+TEST_CASE("a cable whose request AO_Log's queue has no room for is said, and the board wakes",
+          "[lowpower_ao]")
+{
+    static const QEvt filler = QEVT_INITIALIZER(LOG_FLUSH_REQ_SIG);
+
+    lp_up(KODE_OK);
+    go_asleep();
+    (void)bounces();
+    TEST_ASSERT_TRUE(qf_support_queue_stuff(AO_Log, &filler));
+
+    charger_reading(true);
+    expect_state(KODE_LP_AWAKE, KODE_LP_CAUSE_VBUS, KODE_LP_ASLEEP);
+    TEST_ASSERT_TRUE_MESSAGE(log_has("the cable port is not shown to the host again"),
+                             "a refused request was not said");
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, bounces(), "a refused request was queued");
+    lp_down();
+}

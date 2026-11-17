@@ -1444,6 +1444,10 @@ enum KodeSignals {
     POWER_PEEK_REQ_SIG,         /**< AO_Power: take one reading, publish it and keep
                                  *   the wall clock; log nothing and dump no chip.
                                  *   AO_LowPower asks it once a minute asleep. */
+    POWER_CABLE_REQ_SIG,        /**< AO_Power: read whether a cable is in, and
+                                 *   publish a whole reading only when that
+                                 *   differs from the last one published
+                                 *   (power_cable_request()). Static event. */
     POWER_SHIP_REQ_SIG,         /**< AO_Power: ship mode - open the BATFET and
                                  *   cut the battery from VSYS. On battery the
                                  *   board dies handling this event; waking is
@@ -2143,6 +2147,13 @@ enum KodeSignals {
                                  *   Its place in the queue is the point: every
                                  *   line posted before it is on its ports
                                  *   first.                                   */
+    LOG_BOUNCE_REQ_SIG,         /**< AO_Log: a cable came while the cable
+                                 *   port was off the bus; show the port to
+                                 *   the host again unless frames come
+                                 *   (log_bounce_request()). Static event.    */
+    LOG_BOUNCE_TMO_SIG,         /**< AO_Log private QTimeEvt, one-shot: the
+                                 *   wait for a frame, or the pad's time off
+                                 *   the bus, ran out.                        */
     TEST_DOT_REQ_SIG,           /**< AO_TestDot: a station verb from the
                                  *   console (TestDotReqEvt). Answered with
                                  *   TEST_DOT_REC_SIG records and one

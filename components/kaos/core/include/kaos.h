@@ -1975,6 +1975,20 @@ void power_dump_request(void);
 void power_peek_request(void);
 
 /**
+ * @brief Ask AO_Power whether a cable is in: one register of the BQ25896.
+ *
+ * A whole reading, published as POWER_EVT_SIG, follows only when the answer
+ * differs from the last reading published, or when none was. Logs nothing,
+ * reads no gauge and keeps no clock: what AO_LowPower asks every
+ * KODE_LOWPOWER_CABLE_LOOK_MS while the P4 sleeps, ASLEEP or in the CPU part
+ * of an app's rest, where nothing else reads the charger for a cable.
+ *
+ * @return true when the request was queued; false when the queue is within
+ *         KQP_POWER_POST_MARGIN, and nothing was queued.
+ */
+bool power_cable_request(void);
+
+/**
  * @brief Ask AO_Power to read, write or dump one field of one chip.
  *
  * The console's `pmic` and `gauge`. @p field is the resolved driver enum
@@ -4833,6 +4847,23 @@ bool log_dock_lend_request(QActive *who, bool lend);
  *         KQP_LOG_CMD_MARGIN.
  */
 bool log_flush_request(void);
+
+/**
+ * @brief Ask AO_Log to show a host the cable port again (LOG_BOUNCE_REQ_SIG).
+ *
+ * For a cable that came while the P4 slept: each light sleep takes the cable
+ * port's pad off the bus, and a host that failed to enumerate it then may have
+ * given the port up for good. AO_Log waits KHAL_CONSOLE_FRAME_WAIT_MS for a
+ * frame from the host. With none, the pad leaves the bus for
+ * KHAL_CONSOLE_OFF_BUS_MS and comes back, which the host takes for a new
+ * device; a port that gets frames is left on the bus. Either way AO_Log says
+ * so at NOTICE. A request while one runs does nothing. The waits run on the
+ * QP tick, so the asker holds the P4 awake.
+ *
+ * @return false when nothing was posted: AO_Log's queue was within
+ *         KQP_LOG_CMD_MARGIN.
+ */
+bool log_bounce_request(void);
 
 /* ---- AO_Console: the command line ---------------------------------------
  * Owns no hardware. It receives whole lines from AO_Log, parses them
