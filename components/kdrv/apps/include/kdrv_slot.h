@@ -26,13 +26,21 @@ extern "C" {
  */
 #define KDRV_SLOT_PROJECT_MAX 32U /**< Bytes of a project name, with its NUL, as
                                     *   esp_app_desc_t holds it.             */
+#define KDRV_SLOT_VERSION_MAX 32U /**< Bytes of a version, with its NUL, as
+                                    *   esp_app_desc_t holds it.             */
+#define KDRV_SLOT_DATE_MAX    16U /**< Bytes of a build date, with its NUL, as
+                                    *   esp_app_desc_t holds it.             */
+#define KDRV_SLOT_TIME_MAX    16U /**< Bytes of a build time, with its NUL, as
+                                    *   esp_app_desc_t holds it.             */
+#define KDRV_SLOT_IDF_MAX     32U /**< Bytes of an ESP-IDF version, with its
+                                    *   NUL, as esp_app_desc_t holds it.     */
 
 typedef struct {
     char project[KDRV_SLOT_PROJECT_MAX];
-    char version[32];
-    char date[16];
-    char time[16];
-    char idf_ver[32];
+    char version[KDRV_SLOT_VERSION_MAX];
+    char date[KDRV_SLOT_DATE_MAX];
+    char time[KDRV_SLOT_TIME_MAX];
+    char idf_ver[KDRV_SLOT_IDF_MAX];
 } kdrv_slot_desc_t;
 
 /* ---- The slot ------------------------------------------------------------ */
@@ -181,13 +189,16 @@ typedef enum {
 
 /**
  * @brief One app partition as `info` describes it: where it is, whether the
- *        board is running from it, and what image it holds.
+ *        board is running from it, whether otadata names it, and what image
+ *        it holds.
  */
 typedef struct {
     const char       *label;     /**< The partition table's name.            */
     uint32_t          address;   /**< Flash offset.                          */
     uint32_t          size;      /**< In bytes.                              */
     bool              running;   /**< This boot came from it.                */
+    bool              boot;      /**< otadata names it: the next boot that is
+                                  *   not an app's starts it.                */
     bool              has_image; /**< A descriptor could be read from it.    */
     kdrv_slot_desc_t  desc;      /**< That descriptor; all "" when there is
                                   *   none.                                  */
