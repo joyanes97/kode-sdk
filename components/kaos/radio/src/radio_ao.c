@@ -115,6 +115,7 @@ typedef enum {
     RADIO_OUT_WIFI_PROBE_DONE,  /**< One channel of the radio check was heard. */
     RADIO_OUT_BLE_FIND_DONE,    /**< The radio check's BLE listen ended.      */
     RADIO_OUT_BLE_HEAR_DONE,    /**< The advertisement stream's scan started or stopped. */
+    RADIO_OUT_BLE_PAIR_REJECT_DONE, /**< A pairing's refusal ran: KODE_DENIED is none to refuse. */
 #if CONFIG_KODE_LOWPOWER
     RADIO_OUT_SLEEP_DONE,       /**< The sentinel was started or stopped.    */
 #endif
@@ -406,6 +407,12 @@ typedef struct {
     bool    ble_stop_pending;
     bool    wifi_start_pending;
     bool    ble_start_pending;
+    /* The hang-up of a pairing refused on the glass, waiting for the worker:
+     * the driver hangs up through NimBLE's host lock, which only the worker
+     * may wait on. The refusal itself was said at once (radio_pair_refuse()).
+     * Kept across the link's loss and paid by the settle; the driver hangs up
+     * on nobody once that link or its code is gone. */
+    bool    ble_reject_owed;
 
     /* The production row. `test_pending` is its debt, paid by the same
      * settle that pays the services' - after them, because the operator
@@ -1017,27 +1024,61 @@ static void radio_sleep_note(const kdrv_radio_sleep_note_t *n, void *arg);
 
 /* ---- Request helpers ----------------------------------------------------- */
 
+/**
+ * @brief Post a request through one of AO_Radio's doors.
+ *
+ * Every door leaves KQP_RADIO_POST_MARGIN of the queue to what AO_Radio
+ * cannot refuse (kqp_config.h names it): its posts to itself, its time
+ * events, the answers to its own asks and the publishes it subscribes to.
+ * With no room the request is refused, said in the log, and the door tells
+ * its caller, who answers its own asker.
+ *
+ * @param e    The request. A pool event goes back to the pool when refused.
+ * @param what What the log calls it.
+ * @return true when AO_Radio has it.
+ */
+static bool radio_door_post(QEvt const *e, const char *what)
+{
+    bool const posted = QACTIVE_POST_X(AO_Radio, e, KQP_RADIO_POST_MARGIN, NULL);
+
+    if ( !posted )
+    {
+        KLOG_W(TAG, "AO_Radio's queue is full; %s is refused", what);
+    }
+    return posted;
+}
+
+#if RADIO_ASKS
+/**
+ * @brief AO_Radio asks itself: the owner keeps no margin from its own queue.
+ * @param e A static request.
+ */
+static void radio_self_post(QEvt const *e)
+{
+    QACTIVE_POST(AO_Radio, e, AO_Radio);
+}
+#endif
+
 void radio_up_request(void)
 {
     static const QEvt evt = QEVT_INITIALIZER(RADIO_UP_REQ_SIG);
 
-    /* AO_Ir asks for app traffic: the margin is AO_Radio's own. */
-    if ( !QACTIVE_POST_X(AO_Radio, &evt, KQP_RADIO_POST_MARGIN, NULL) )
-    {
-        KLOG_W(TAG, "AO_Radio's queue is full; a request for the link is dropped");
-    }
+    /* AO_Ir asks for app traffic: its own budget for the link covers a refusal. */
+    (void)radio_door_post(&evt, "a request for the link");
 }
 
-void radio_down_request(void)
+bool radio_down_request(void)
 {
     static const QEvt evt = QEVT_INITIALIZER(RADIO_DOWN_REQ_SIG);
-    QACTIVE_POST(AO_Radio, &evt, NULL);
+
+    return radio_door_post(&evt, "a request to take the link down");
 }
 
-void radio_state_request(void)
+bool radio_state_request(void)
 {
     static const QEvt evt = QEVT_INITIALIZER(RADIO_STATE_REQ_SIG);
-    QACTIVE_POST(AO_Radio, &evt, NULL);
+
+    return radio_door_post(&evt, "a request for the link's state");
 }
 
 void radio_boot_hold(void)
@@ -1054,16 +1095,22 @@ void radio_boot_release(void)
 void radio_park_request(kdrv_radio_note_t target)
 {
     RadioParkEvt *e = Q_NEW_X(RadioParkEvt, 0U, RADIO_PARK_REQ_SIG);
+    bool          asked = false;
+
     if ( NULL != e )
     {
         e->target = (uint8_t)target;
-        QACTIVE_POST(AO_Radio, &e->super, NULL);
+        asked     = radio_door_post(&e->super, "the park");
     }
     else
     {
-        /* No block to carry the ask, so no park: the jump is answered
-         * as if the C5 had refused, rather than left waiting for it. */
         KLOG_E(TAG, "out of events; the C5 is not parked");
+    }
+    if ( !asked )
+    {
+        /* No block to carry the ask, or no room for it, so no park: the
+         * jump is answered as if the C5 had refused, rather than left
+         * waiting for it. */
         boot_radio_parked();
     }
 }
@@ -1103,8 +1150,7 @@ bool id_sign_request(QActive *who, const char *nonce)
             e->nonce[n] = '\0';
         }
     }
-    QACTIVE_POST(AO_Radio, &e->super, NULL);
-    return true;
+    return radio_door_post(&e->super, "a request to sign");
 }
 
 bool wifi_frames_request(QActive *who, bool on, uint8_t channel)
@@ -1133,8 +1179,7 @@ bool c5_wipe_request(QActive *who)
         return false;
     }
     e->who = who;
-    QACTIVE_POST(AO_Radio, &e->super, NULL);
-    return true;
+    return radio_door_post(&e->super, "a request to wipe the C5");
 }
 
 bool id_request(QActive *who, uint8_t op, uint8_t n, uint8_t of,
@@ -1155,8 +1200,7 @@ bool id_request(QActive *who, uint8_t op, uint8_t n, uint8_t of,
         (void)memcpy(e->der, der, len);
         e->len = (uint8_t)len;
     }
-    QACTIVE_POST(AO_Radio, &e->super, NULL);
-    return true;
+    return radio_door_post(&e->super, "an identity request");
 }
 
 /** @brief Where the one asked scan stands (Radio.ask_scan). */
@@ -1418,45 +1462,49 @@ bool wifi_leave_request(void)
     return QACTIVE_POST_X(AO_Radio, wifi_leave_evt(), KQP_RADIO_POST_MARGIN, NULL);
 }
 
-void wifi_start_request(void)
+/** @brief The request to start Wi-Fi, one static event for the door and AO_Radio's own ask. */
+static const QEvt s_wifi_start_evt = QEVT_INITIALIZER(WIFI_START_REQ_SIG);
+
+/** @brief The request to stop Wi-Fi, one static event for the door and AO_Radio's own ask. */
+static const QEvt s_wifi_stop_evt = QEVT_INITIALIZER(WIFI_STOP_REQ_SIG);
+
+bool wifi_start_request(void)
 {
-    static const QEvt evt = QEVT_INITIALIZER(WIFI_START_REQ_SIG);
-    QACTIVE_POST(AO_Radio, &evt, NULL);
+    return radio_door_post(&s_wifi_start_evt, "a request to start Wi-Fi");
 }
 
-void wifi_stop_request(void)
+bool wifi_stop_request(void)
 {
-    static const QEvt evt = QEVT_INITIALIZER(WIFI_STOP_REQ_SIG);
-    QACTIVE_POST(AO_Radio, &evt, NULL);
+    return radio_door_post(&s_wifi_stop_evt, "a request to stop Wi-Fi");
 }
 
-void wifi_state_request(void)
+bool wifi_state_request(void)
 {
     static const QEvt evt = QEVT_INITIALIZER(WIFI_STATE_REQ_SIG);
-    QACTIVE_POST(AO_Radio, &evt, NULL);
+
+    return radio_door_post(&evt, "a request for Wi-Fi's state");
 }
 
-void wifi_fast_request(bool on)
+bool wifi_fast_request(bool on)
 {
     /* Static events, one per wish: nothing to allocate, so a wish to go back
      * to the default can never be lost to an empty pool. */
     static const WifiFastEvt fast_on  = { QEVT_INITIALIZER(WIFI_FAST_REQ_SIG), true };
     static const WifiFastEvt fast_off = { QEVT_INITIALIZER(WIFI_FAST_REQ_SIG), false };
+    QEvt const              *evt      = &fast_off.super;
 
     if ( on )
     {
-        QACTIVE_POST(AO_Radio, &fast_on.super, NULL);
+        evt = &fast_on.super;
     }
-    else
-    {
-        QACTIVE_POST(AO_Radio, &fast_off.super, NULL);
-    }
+    return radio_door_post(evt, "a request for fast mode");
 }
 
-void wifi_rssi_request(void)
+bool wifi_rssi_request(void)
 {
     static const QEvt evt = QEVT_INITIALIZER(WIFI_RSSI_REQ_SIG);
-    QACTIVE_POST(AO_Radio, &evt, NULL);
+
+    return radio_door_post(&evt, "a request for the signal");
 }
 
 /** @brief The autojoin request, one static event for both ways of posting it. */
@@ -1472,35 +1520,44 @@ bool wifi_auto_request(void)
     return QACTIVE_POST_X(AO_Radio, wifi_auto_evt(), KQP_RADIO_POST_MARGIN, NULL);
 }
 
-/** @brief AO_Radio asks itself to autojoin: the owner keeps no margin from its own queue. */
+/** @brief AO_Radio asks itself to autojoin. */
 static void wifi_auto_self(void)
 {
-    QACTIVE_POST(AO_Radio, &s_wifi_auto_evt, NULL);
+    radio_self_post(&s_wifi_auto_evt);
 }
 
-void wifi_list_request(void)
+bool wifi_list_request(void)
 {
     static const QEvt evt = QEVT_INITIALIZER(WIFI_LIST_REQ_SIG);
-    QACTIVE_POST(AO_Radio, &evt, NULL);
+
+    return radio_door_post(&evt, "a request for the saved networks");
 }
 
-void wifi_forget_request(const char *ssid)
+bool wifi_forget_request(const char *ssid)
 {
-    WifiJoinEvt *e = Q_NEW_X(WifiJoinEvt, 0U, WIFI_FORGET_REQ_SIG);
+    WifiJoinEvt *e      = Q_NEW_X(WifiJoinEvt, 0U, WIFI_FORGET_REQ_SIG);
+    bool         posted = false;
+
     if ( NULL != e )
     {
         (void)snprintf(e->ssid, sizeof(e->ssid), "%s", ssid);
         e->pass[0] = '\0';   /* forgetting needs no secret */
-        QACTIVE_POST(AO_Radio, &e->super, NULL);
+        posted     = radio_door_post(&e->super, "a request to forget a network");
     }
+    return posted;
 }
 #endif /* CONFIG_KODEOS_WIFI */
 
 #if CONFIG_KODEOS_BLE
-void ble_start_request(void)
+/** @brief The request to start BLE, one static event for the door and AO_Radio's own ask. */
+static const QEvt s_ble_start_evt = QEVT_INITIALIZER(BLE_START_REQ_SIG);
+
+/** @brief The request to stop BLE, one static event for the door and AO_Radio's own ask. */
+static const QEvt s_ble_stop_evt = QEVT_INITIALIZER(BLE_STOP_REQ_SIG);
+
+bool ble_start_request(void)
 {
-    static const QEvt evt = QEVT_INITIALIZER(BLE_START_REQ_SIG);
-    QACTIVE_POST(AO_Radio, &evt, NULL);
+    return radio_door_post(&s_ble_start_evt, "a request to start BLE");
 }
 
 bool ble_scan_request(uint32_t ms, uint8_t *gen)
@@ -1645,10 +1702,9 @@ bool ble_enabled(void)
     return __atomic_load_n(&s_ble_on, __ATOMIC_ACQUIRE);
 }
 
-void ble_stop_request(void)
+bool ble_stop_request(void)
 {
-    static const QEvt evt = QEVT_INITIALIZER(BLE_STOP_REQ_SIG);
-    QACTIVE_POST(AO_Radio, &evt, NULL);
+    return radio_door_post(&s_ble_stop_evt, "a request to stop BLE");
 }
 
 void ble_state_request(void)
@@ -1656,10 +1712,11 @@ void ble_state_request(void)
     radio_knocks_post(RADIO_KNOCK_STATE, 0U);
 }
 
-void ble_unpair_request(void)
+bool ble_unpair_request(void)
 {
     static const QEvt evt = QEVT_INITIALIZER(BLE_UNPAIR_REQ_SIG);
-    QACTIVE_POST(AO_Radio, &evt, NULL);
+
+    return radio_door_post(&evt, "a request to forget the bonds");
 }
 
 bool ble_pair_open_request(void)
@@ -1671,27 +1728,28 @@ bool ble_pair_open_request(void)
 }
 
 #if CONFIG_KODEOS_BLE_PAIRING_PASSKEY
-void ble_pair_reject_request(void)
+bool ble_pair_reject_request(void)
 {
     static const QEvt evt = QEVT_INITIALIZER(BLE_PAIR_REJECT_REQ_SIG);
-    QACTIVE_POST(AO_Radio, &evt, NULL);
+
+    return radio_door_post(&evt, "a refusal of the pairing");
 }
 #endif
 #endif /* CONFIG_KODEOS_BLE */
 
-void c5_flash_request(uint8_t src_kind, const char *src)
+bool c5_flash_request(uint8_t src_kind, const char *src)
 {
     FlashReqEvt *e = Q_NEW_X(FlashReqEvt, 0U, FLASH_REQ_SIG);
     if ( NULL == e )
     {
         KLOG_E(TAG, "out of events; C5 update request dropped");
-        return;
+        return false;
     }
     e->src_kind = src_kind;
     e->dst_kind = (uint8_t)KFW_TARGET_C5;
     e->launch   = false;
     (void)snprintf(e->src, sizeof(e->src), "%s", src);
-    QACTIVE_POST(AO_Radio, &e->super, NULL);
+    return radio_door_post(&e->super, "a C5 update");
 }
 
 bool c5_recv_request(uint32_t size, uint32_t crc32, uint8_t src)
@@ -1708,39 +1766,40 @@ bool c5_recv_request(uint32_t size, uint32_t crc32, uint8_t src)
     e->launch = false;
     e->src    = src;
     e->name[0] = '\0';
-    QACTIVE_POST(AO_Radio, &e->super, NULL);
-    return true;
+    return radio_door_post(&e->super, "install dst=c5");
 }
 
-void c5_test_request(void)
+bool c5_test_request(void)
 {
     static const RadioTestReqEvt evt = {
         QEVT_INITIALIZER(RADIO_TEST_REQ_SIG), false
     };
-    QACTIVE_POST(AO_Radio, &evt.super, NULL);
+
+    return radio_door_post(&evt.super, "the c5 row");
 }
 
-void c5_test_request_user(void)
+bool c5_test_request_user(void)
 {
     static const RadioTestReqEvt evt = {
         QEVT_INITIALIZER(RADIO_TEST_REQ_SIG), true
     };
-    QACTIVE_POST(AO_Radio, &evt.super, NULL);
+
+    return radio_door_post(&evt.super, "the c5 row");
 }
 
-void c5_field_request(QActive *who, uint8_t op, uint16_t field, int32_t value)
+bool c5_field_request(QActive *who, uint8_t op, uint16_t field, int32_t value)
 {
     RadioFieldReqEvt *e = Q_NEW_X(RadioFieldReqEvt, 0U, RADIO_FIELD_REQ_SIG);
     if ( NULL == e )
     {
         KLOG_E(TAG, "out of events; a c5 field request is dropped");
-        return;
+        return false;
     }
     e->who   = who;
     e->op    = op;
     e->field = field;
     e->value = value;
-    QACTIVE_POST(AO_Radio, &e->super, NULL);
+    return radio_door_post(&e->super, "a c5 field request");
 }
 
 void radio_amp_request(bool on)
@@ -1773,9 +1832,9 @@ QEvt const *exp_power_evt(bool on)
     return evt;
 }
 
-void exp_power_request(bool on)
+bool exp_power_request(bool on)
 {
-    QACTIVE_POST(AO_Radio, exp_power_evt(on), NULL);
+    return radio_door_post(exp_power_evt(on), "a request for the header's 3.3 V");
 }
 
 #if CONFIG_KODEOS_WIFI
@@ -4875,6 +4934,29 @@ static void ble_publish_pair(Radio * const me)
     }
     QACTIVE_PUBLISH(&ev->super, &me->super);
 }
+
+/**
+ * @brief BLE_PAIR_REJECT_REQ_SIG: refuse the pairing on the glass at once,
+ *        and owe its hang-up to the worker.
+ *
+ * The refusal takes no lock of NimBLE's, so it is said here, and a peer that
+ * finishes typing the code afterwards is undone by the driver. The hang-up
+ * takes NimBLE's host lock, which the worker may hold for seconds while it
+ * writes a key: a job, paid by the next radio_settle().
+ *
+ * @param me The AO.
+ * @return true when a pairing was there to refuse and its hang-up is owed.
+ */
+static bool radio_pair_refuse(Radio * const me)
+{
+    bool const refused = (KODE_OK == kdrv_ble_pair_reject());
+
+    if ( refused )
+    {
+        me->ble_reject_owed = true;
+    }
+    return refused;
+}
 #endif /* CONFIG_KODEOS_BLE_PAIRING_PASSKEY */
 #endif /* CONFIG_KODEOS_BLE */
 
@@ -5653,6 +5735,7 @@ static radio_out_t radio_out_of(kdrv_radio_job_t type)
         case KDRV_RADIO_JOB_WIFI_PROBE:   out = RADIO_OUT_WIFI_PROBE_DONE;   break;
         case KDRV_RADIO_JOB_BLE_FIND:     out = RADIO_OUT_BLE_FIND_DONE;     break;
         case KDRV_RADIO_JOB_BLE_HEAR:     out = RADIO_OUT_BLE_HEAR_DONE;     break;
+        case KDRV_RADIO_JOB_BLE_PAIR_REJECT: out = RADIO_OUT_BLE_PAIR_REJECT_DONE; break;
 #if CONFIG_KODE_LOWPOWER
         case KDRV_RADIO_JOB_SLEEP:        out = RADIO_OUT_SLEEP_DONE;        break;
 #endif
@@ -6320,13 +6403,17 @@ static void radio_test_clear(Radio * const me)
 }
 
 /**
- * @brief The verdict, and the end of the row.
+ * @brief Say the c5 row's verdict, and publish it.
  *
  * Logged before it is published, because the log is what the operator
  * reads: the console prints `result=fail` and nothing else, and the reason
- * has to be on the line above it.
+ * has to be on the line above it. It touches nothing of AO_Radio's, so the
+ * row may call it from AO_Autotest's thread.
+ *
+ * @param ok  The verdict.
+ * @param why Why it failed; NULL on a pass.
  */
-static void c5_test_end(Radio * const me, bool ok, const char *why)
+static void c5_verdict(bool ok, const char *why)
 {
     if ( ok )
     {
@@ -6342,12 +6429,23 @@ static void c5_test_end(Radio * const me, bool ok, const char *why)
         (void)snprintf(r->name, sizeof(r->name), "%s", "c5");
         r->ok = ok;
         r->origin = TEST_ORIGIN_AUTOTEST;
-        QACTIVE_PUBLISH(&r->super, &me->super);
+        QACTIVE_PUBLISH(&r->super, AO_Radio);
     }
     else
     {
         KLOG_E(TAG, "out of events; the c5 verdict is lost");
     }
+}
+
+/**
+ * @brief The verdict, and the end of the row.
+ * @param me  AO_Radio.
+ * @param ok  The verdict.
+ * @param why Why it failed; NULL on a pass.
+ */
+static void c5_test_end(Radio * const me, bool ok, const char *why)
+{
+    c5_verdict(ok, why);
     radio_test_clear(me);
 }
 
@@ -7186,7 +7284,7 @@ static void radio_reconcile_next(Radio * const me)
     if ( ((uint8_t)RECON_START == me->recon) && me->ble_want )
     {
         me->recon = (uint8_t)RECON_BLE;
-        ble_start_request();
+        radio_self_post(&s_ble_start_evt);
         return;
     }
 #endif
@@ -8005,6 +8103,18 @@ static void radio_settle(Radio * const me)
     {
         return;   /* a job is in flight; its completion calls us back */
     }
+#if CONFIG_KODEOS_BLE_PAIRING_PASSKEY
+    if ( me->ble_reject_owed )
+    {
+        /* First of all: a refused peer still holds the one link, and the
+         * job is short. */
+        if ( radio_submit(me, KDRV_RADIO_JOB_BLE_PAIR_REJECT) )
+        {
+            me->ble_reject_owed = false;
+        }
+        return;   /* sent, or refused: the next completion tries again */
+    }
+#endif
 #if CONFIG_KODEOS_WIFI
     if ( me->wifi_stop_pending )
     {
@@ -9515,6 +9625,7 @@ void Radio_ctor(void)
     me->ble_stop_pending   = false;
     me->wifi_start_pending = false;
     me->ble_start_pending  = false;
+    me->ble_reject_owed    = false;
     me->pb_phase     = (uint8_t)PB_IDLE;
     me->pb_job       = false;
     me->pb_rsp       = NULL;
@@ -9650,6 +9761,10 @@ AO_STORAGE(radio, KQP_RADIO_QUEUE_LEN, KQP_AO_STACK_LARGE);
 #if CONFIG_KODEOS_AUTOTEST
 /* ---- The self-test rows: registered by kaos_radio_register() ---------------- */
 
+/** @brief Why a c5 row fails at once: AO_Radio had no room to run it, and
+ *         nothing would answer before the row's budget ran out. */
+#define RADIO_ROW_REFUSED  "AO_Radio's queue is full; the row did not start"
+
 /**
  * @brief The coprocessor's row: AO_Radio runs it and answers TEST_RESULT_SIG.
  *
@@ -9658,11 +9773,15 @@ AO_STORAGE(radio, KQP_RADIO_QUEUE_LEN, KQP_AO_STACK_LARGE);
  * chip, and a scan for the antenna.
  * Every reading goes out as a log line before the verdict.
  *
- * @return false: AO_Radio answers later, with TEST_RESULT_SIG.
+ * @return false: AO_Radio answers later, with TEST_RESULT_SIG, or the row
+ *         fails at once when AO_Radio's queue has no room for it.
  */
 static bool radio_row_c5(void)
 {
-    c5_test_request();
+    if ( !c5_test_request() )
+    {
+        c5_verdict(false, RADIO_ROW_REFUSED);
+    }
     return false;
 }
 
@@ -9679,11 +9798,17 @@ static bool radio_row_ble_console(void)
 }
 #endif
 
-/** @brief The coprocessor's row without the production line's access point:
- *         the link, the snapshot, a sweep that completes, the controller. */
+/**
+ * @brief The coprocessor's row without the production line's access point:
+ *        the link, the snapshot, a sweep that completes, the controller.
+ * @return false, as radio_row_c5() does.
+ */
 static bool radio_row_c5_user(void)
 {
-    c5_test_request_user();
+    if ( !c5_test_request_user() )
+    {
+        c5_verdict(false, RADIO_ROW_REFUSED);
+    }
     return false;
 }
 #endif
@@ -10042,11 +10167,11 @@ static bool radio_config(Radio * const me, QEvt const * const e)
         {
             if ( r->b )
             {
-                wifi_start_request();
+                radio_self_post(&s_wifi_start_evt);
             }
             else
             {
-                wifi_stop_request();
+                radio_self_post(&s_wifi_stop_evt);
             }
         }
 #endif
@@ -10055,11 +10180,11 @@ static bool radio_config(Radio * const me, QEvt const * const e)
         {
             if ( r->b )
             {
-                ble_start_request();
+                radio_self_post(&s_ble_start_evt);
             }
             else
             {
-                ble_stop_request();
+                radio_self_post(&s_ble_stop_evt);
             }
         }
 #endif
@@ -11290,7 +11415,12 @@ static QState Radio_down(Radio * const me, QEvt const * const e)
             break;
         }
         case BLE_PAIR_REJECT_REQ_SIG: {
-            (void)kdrv_ble_pair_reject();
+            /* Said at once; the hang-up is owed to the link: the driver hangs
+             * up on the worker, and the worker takes jobs while the link is up. */
+            if ( radio_pair_refuse(me) )
+            {
+                KLOG_N(TAG, "pairing: the hang-up waits for the link");
+            }
             status = Q_HANDLED();
             break;
         }
@@ -12573,6 +12703,19 @@ static QState Radio_up_outcome(Radio * const me, RadioOutcome const * const job)
             status = Q_HANDLED();
             break;
         }
+        case RADIO_OUT_BLE_PAIR_REJECT_DONE: {
+            /* The refusal was said when it was asked; KODE_DENIED is a hang-up
+             * with nobody left to hang up on (the link ended, a new code
+             * replaced the refused one, or the driver undid the pairing),
+             * which nobody needs told. */
+            me->busy = false;
+            if ( ((uint8_t)KODE_OK != job->status) && ((uint8_t)KODE_DENIED != job->status) )
+            {
+                KLOG_W(TAG, "pairing: the hang-up failed (%u)", (unsigned)job->status);
+            }
+            status = Q_HANDLED();
+            break;
+        }
         case RADIO_OUT_BLE_UNPAIR_DONE: {
             me->busy = false;
             if ( me->wiping && ((uint8_t)C5_WIPE_BLE == me->wipe_step) )
@@ -13649,9 +13792,14 @@ static QState Radio_up(Radio * const me, QEvt const * const e)
             break;
         }
         case BLE_PAIR_REJECT_REQ_SIG: {
-            /* No advert sweep here. A refusal ends in a disconnect, and the
-             * disconnect is already what restores the invariant. */
-            (void)kdrv_ble_pair_reject();
+            /* Said at once; the hang-up is a job, as every call that takes
+             * NimBLE's host lock: the worker may hold that lock for seconds
+             * while it writes a key, and AO_Radio waits on nothing. Sent now,
+             * or when the job in flight ends. */
+            if ( radio_pair_refuse(me) )
+            {
+                radio_settle(me);
+            }
             status = Q_HANDLED();
             break;
         }
@@ -14873,6 +15021,19 @@ static QState Radio_updating(Radio * const me, QEvt const * const e)
             status = Q_HANDLED();
             break;
         }
+#if CONFIG_KODEOS_BLE_PAIRING_PASSKEY
+        case BLE_PAIR_REJECT_REQ_SIG: {
+            /* Said at once, so the peer cannot finish pairing; the hang-up
+             * waits, as every job does, for the update to end: the next
+             * settle sends it, or the link's end leaves nobody to hang up on. */
+            if ( radio_pair_refuse(me) )
+            {
+                KLOG_N(TAG, "pairing: the hang-up waits for the update");
+            }
+            status = Q_HANDLED();
+            break;
+        }
+#endif
         case BLE_SCAN_REQ_SIG: {
             /* Apart from the others because it closes on a different event:
              * `ble_scan` waits for the scan's end marker, exactly as

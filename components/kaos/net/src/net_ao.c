@@ -93,6 +93,9 @@ typedef enum {
 /** @brief The fast mode outlives the last job that held it by this long (5 s). */
 #define NET_FAST_JOB_HOLD_MS   5000U
 
+/** @brief A fast-mode wish AO_Radio had no room for is asked again after this long. */
+#define NET_FAST_RETRY_MS      100U
+
 /** @brief The network worker's task name. */
 #define NET_WORKER_NAME        "net_worker"
 
@@ -433,6 +436,9 @@ typedef struct {
     QTimeEvt jtmo;     /**< One-shot: the jobs' hold, which outlives the last
                         *   job by NET_FAST_JOB_HOLD_MS. Delivers
                         *   NET_JOB_FAST_SIG.                                */
+    QTimeEvt fretry;   /**< One-shot: a fast-mode wish AO_Radio had no room
+                        *   for is asked again after NET_FAST_RETRY_MS.
+                        *   Delivers NET_FAST_RETRY_SIG.                     */
     bool     jfast;    /**< The jobs hold the fast mode: a worker has a job,
                         *   or the tail of the last one is running.          */
     bool     fast_asked; /**< AO_Radio was last asked for the fast mode, and
@@ -1529,7 +1535,9 @@ static kode_status_t net_stream_run(void *arg, uint32_t *value)
  *
  * The fast mode is wanted while the channel holds it (@c cfast) or the jobs
  * do (@c jfast). Asking for what was asked already does nothing, so the first
- * hold to begin is one request and the last to end is one.
+ * hold to begin is one request and the last to end is one. A request
+ * AO_Radio had no room for is not counted as asked, and is asked again after
+ * NET_FAST_RETRY_MS whether or not the holds change by then.
  *
  * @param me The AO.
  */
@@ -1542,8 +1550,15 @@ static void net_fast_eval(Net * const me)
 #endif
     if ( want != me->fast_asked )
     {
-        me->fast_asked = want;
-        wifi_fast_request(want);
+        if ( wifi_fast_request(want) )
+        {
+            me->fast_asked = want;
+        }
+        else
+        {
+            (void)QTimeEvt_disarm(&me->fretry);
+            QTimeEvt_armX(&me->fretry, KQP_TICKS_PER_MS(NET_FAST_RETRY_MS), 0U);
+        }
     }
 }
 
@@ -1634,6 +1649,7 @@ static void net_fast_job_tail(Net * const me)
 static void net_fast_gone(Net * const me)
 {
     (void)QTimeEvt_disarm(&me->jtmo);
+    (void)QTimeEvt_disarm(&me->fretry);
     me->jfast      = false;
     me->fast_asked = false;
 }
@@ -5623,6 +5639,7 @@ void Net_ctor(void)
     QTimeEvt_ctorX(&me->wguard.te, &me->super, NET_JOB_GUARD_SIG, 0U);
     QTimeEvt_ctorX(&me->sguard.te, &me->super, NET_STREAM_GUARD_SIG, 0U);
     QTimeEvt_ctorX(&me->jtmo, &me->super, NET_JOB_FAST_SIG, 0U);
+    QTimeEvt_ctorX(&me->fretry, &me->super, NET_FAST_RETRY_SIG, 0U);
     me->jfast      = false;
     me->fast_asked = false;
     me->phase = (uint8_t)MQTT_IDLE;
@@ -6725,9 +6742,10 @@ static QState Net_initial(Net * const me, void const * const par)
         radio_lp_expect_net(true);   /* an OFF round waits for this AO's leave */
     }
     /* The scheduler's check wakes the radio, and has nothing to wake while the
-     * C5 link is down: ask where it stands rather than wait for an edge. */
+     * C5 link is down: ask where it stands rather than wait for an edge. A
+     * refusal is AO_Radio's line in the log; the next edge still comes. */
     QActive_subscribe(&me->super, RADIO_STATE_SIG);
-    radio_state_request();
+    (void)radio_state_request();
 #endif
 #if CONFIG_KODEOS_CHANNEL
     /* The setting this AO owns, `chan`: on unless the store says off. */
@@ -6780,8 +6798,9 @@ static QState Net_initial(Net * const me, void const * const par)
 
     /* Ask rather than wait for an edge that may have passed. Safe because
      * kode_init() starts AO_Radio before this AO: posting to an AO with no
-     * queue asserts. */
-    wifi_state_request();
+     * queue asserts. A refusal is AO_Radio's line in the log; the next edge
+     * still comes. */
+    (void)wifi_state_request();
 
     KLOG_I(TAG, "network services up (offline until there is an address)");
     return Q_TRAN(&Net_offline);
@@ -6878,6 +6897,11 @@ static QState Net_root(Net * const me, QEvt const * const e)
         }
         case NET_JOB_FAST_SIG: {
             net_fast_job_tail(me);
+            status = Q_HANDLED();
+            break;
+        }
+        case NET_FAST_RETRY_SIG: {
+            net_fast_eval(me);
             status = Q_HANDLED();
             break;
         }
