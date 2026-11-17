@@ -453,18 +453,17 @@ static bool wifi_scan_keep(const kode_sys_wifi_ap_t *ap, void *ctx)
 
 /**
  * @brief Keep why the scan failed as the task's error.
- * @param rc What the facade answered.
+ * @param rc   What the facade answered.
+ * @param rest The answer says an app rests the radio.
  */
-static void wifi_scan_fail(kode_status_t rc)
+static void wifi_scan_fail(kode_status_t rc, bool rest)
 {
     const uint32_t seconds = KODE_WIFI_SCAN_MS / KODE_MS_PER_S;
-    uint8_t        parts   = 0U;
 
     switch ( rc )
     {
     case KODE_DENIED:
-        (void)kode_block_rest_answers(NULL, &parts, NULL, NULL);
-        if ( 0U != (parts & KODE_SYS_REST_RADIO) )
+        if ( rest )
         {
             kode_err_set("kode_wifi_scan: the radio is at rest; kode_rest_end() first");
         }
@@ -474,8 +473,8 @@ static void wifi_scan_fail(kode_status_t rc)
         }
         break;
     case KODE_NO_RESOURCES:
-        kode_err_set("the radio is busy with another scan, its search for a network, "
-                     "a self-test or an install; try again");
+        kode_err_set("the radio is busy with another scan, a network search, "
+                     "a self-test, an install or the board's rest; try again");
         break;
     case KODE_CANCELLED:
         kode_err_set("a newer Wi-Fi request ended the scan early; do not scan again at once");
@@ -505,7 +504,9 @@ int kode_wifi_scan(kode_wifi_network_t *out, size_t cap)
     else
     {
         wifi_scan_keep_t    keep = { out, cap, 0U };
-        kode_status_t const rc   = kode_block_wifi_scan(&wifi_scan_keep, &keep, KODE_WIFI_SCAN_MS);
+        bool                rest = false;
+        kode_status_t const rc   = kode_block_wifi_scan(&wifi_scan_keep, &keep, KODE_WIFI_SCAN_MS,
+                                                        &rest);
 
         if ( KODE_OK == rc )
         {
@@ -513,7 +514,7 @@ int kode_wifi_scan(kode_wifi_network_t *out, size_t cap)
         }
         else
         {
-            wifi_scan_fail(rc);
+            wifi_scan_fail(rc, rest);
         }
     }
     wifi_exit();
