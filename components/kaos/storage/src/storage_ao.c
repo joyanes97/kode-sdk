@@ -385,6 +385,7 @@ typedef struct {
 
     /* The card's mount, as STORAGE_CARD_SIG last told it. */
     bool           card_told;                  /**< A mounted card was the last news. */
+    bool           card_told_away;             /**< A card at rest for an app, still in, was the last news. */
     bool           card_fresh;                 /**< A call mounted the card again: the mount told is not this one. */
 
     /* The pass over a card just mounted, for what a cut copy of an app left. */
@@ -4322,8 +4323,8 @@ static void answer_path_stat(QActive *who, uint8_t op, const char *path)
  * every later open on /sdcard reading length 0, and the log must say a write
  * was tried. A spare line is cheap. Keep it here, in the card's owner, not in
  * the driver or the console: writes nobody typed (`install dst=app`) pass
- * through here too. The data folders, which kodeOS places itself, call
- * warn_if_unproven_card() instead.
+ * through here too. The data folders and the apps' copies, which kodeOS places
+ * itself, call warn_if_unproven_card() instead.
  *
  * @param verb What is about to be attempted, as an operator would name it -
  *             "mkdir", "rm", "mv", "write". It goes on the wire verbatim, so
@@ -4343,8 +4344,8 @@ static void warn_if_card(const char *verb, const char *path)
  * @brief warn_if_card() for a change kodeOS makes on the card by its own
  *        choice: said only when the card has not proved it takes a write.
  *
- * On a card that has, a data folder is where it belongs, and a line for each
- * would bury the log.
+ * On a card that has, a data folder or an app's copy is where it belongs, and
+ * a line for each would bury the log.
  *
  * @param verb As warn_if_card() takes it.
  * @param path As warn_if_card() takes it.
@@ -4495,7 +4496,8 @@ static void answer_pair_move(QActive *who, uint8_t op, const char *src,
  * original back. One dispatch step, one answer. A reset between the two
  * renames leaves the name free, the original as `<dst>.bak` and @p src where it
  * was: the next replacement of the name puts its copy there and removes that
- * backup. A `<dst>.bak` that is there is removed, and said.
+ * backup. A `<dst>.bak` that is there is removed, and said. On the card it is
+ * said only while the card has not proved it takes a write, whoever asks.
  */
 static void answer_pair_replace(QActive *who, uint8_t op, const char *src,
                                 const char *dst)
@@ -4504,7 +4506,7 @@ static void answer_pair_replace(QActive *who, uint8_t op, const char *src,
     kdrv_stat_t   st   = { .exists = false, .is_dir = false, .size = 0U };
     kode_status_t rc;
 
-    warn_if_card("replace", dst);
+    warn_if_unproven_card("replace", dst);
     int const wrote = snprintf(bak, sizeof(bak), "%s" STORAGE_REPLACE_BAK, dst);
     if ( (0 > wrote) || ((size_t)wrote >= sizeof(bak)) )
     {
@@ -7804,6 +7806,7 @@ void Storage_ctor(void)
     me->reader = NULL;
     me->writer = NULL;
     me->card_told  = false;
+    me->card_told_away = false;
     me->card_fresh = false;
     me->sweep_owed  = false;
     me->sweep_paced = false;
@@ -9424,12 +9427,32 @@ static void read_expired(Storage * const me)
 }
 
 /**
+ * @brief Whether the card is away for an app's rest and still in, as far as
+ *        is known.
+ *
+ * Put away by the rest and not yet brought back, and mounted when it went: a
+ * rest with no card in the slot puts nothing away.
+ *
+ * @param me The AO.
+ * @return true for a card at rest.
+ */
+static bool card_away(const Storage * const me)
+{
+#if defined(CONFIG_KODE_LOWPOWER)
+    return me->card_rested && (me->card_told || me->card_told_away);
+#else
+    (void)me;
+    return false;
+#endif
+}
+
+/**
  * @brief Publish STORAGE_CARD_SIG when the card's mount is not the one last told.
  *
- * A card that mounts, one mounted again by a single call, and one that is
- * mounted no more. Run at the end of every event served. While a call to the
- * card is out the driver's answer is the worker's to change, so it is read
- * when the call has returned.
+ * A card that mounts, one mounted again by a single call, one that is mounted
+ * no more, one an app's rest put away, and one whose wake found no card. Run at
+ * the end of every event served. While a call to the card is out the driver's
+ * answer is the worker's to change, so it is read when the call has returned.
  *
  * @param me The AO.
  */
@@ -9437,16 +9460,20 @@ static void card_note(Storage * const me)
 {
     if ( !me->sdj.busy )
     {
-        bool const now = kdrv_storage_mounted(KDRV_MEDIUM_SD);
+        bool const now  = kdrv_storage_mounted(KDRV_MEDIUM_SD);
+        bool const away = (!now) && card_away(me);
 
-        if ( (now != me->card_told) || (now && me->card_fresh) )
+        if ( (now != me->card_told) || (away != me->card_told_away)
+            || (now && me->card_fresh) )
         {
             StorageCardEvt *ev = Q_NEW_X(StorageCardEvt, 0U, STORAGE_CARD_SIG);
 
             if ( NULL != ev )
             {
                 ev->mounted    = now;
+                ev->rested     = away;
                 me->card_told  = now;
+                me->card_told_away = away;
                 me->card_fresh = false;
                 me->sweep_owed = now;      /* a card just mounted has its root walked */
                 sweep_stop(me);            /* from its first name */

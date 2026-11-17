@@ -3307,7 +3307,9 @@ typedef enum {
                              *   already there is removed. A reset between the
                              *   steps leaves the file that was there as
                              *   `<dst>.bak` and @p src where it was, never a
-                             *   cut file on @p dst.                           */
+                             *   cut file on @p dst. On the card it is warned
+                             *   about only while the card has not proved it
+                             *   takes a write, whoever asks.                   */
 } storage_pair_op_t;
 
 /**

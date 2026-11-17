@@ -7346,6 +7346,104 @@ TEST_CASE("the card comes back on the worker, and the write waits for it", "[sto
     expect_written_on(KDRV_MEDIUM_SD);
 }
 
+/**
+ * @brief Whether the last STORAGE_CARD_SIG the spy holds said @p mounted and
+ *        @p rested, the spy drained; false when it holds none.
+ */
+static bool card_last_said(bool mounted, bool rested)
+{
+    bool seen = false;
+    bool m    = false;
+    bool r    = false;
+
+    for ( const QEvt *e = ao_spy_take(); NULL != e; e = ao_spy_take() )
+    {
+        if ( STORAGE_CARD_SIG == (enum_t)e->sig )
+        {
+            seen = true;
+            m    = ((const StorageCardEvt *)e)->mounted;
+            r    = ((const StorageCardEvt *)e)->rested;
+        }
+    }
+    return seen && (mounted == m) && (rested == r);
+}
+
+/* AO_AppMgr tells a card put away from a card that is gone: the rest is
+ * published as a card at rest, the wake as a card mounted, and a wake that
+ * finds no card as a card that is not there. */
+TEST_CASE("an app's rest of the card is published as a card at rest, and its wake as mounted",
+          "[storage_ao][lowpower][card]")
+{
+    static const uint8_t payload[64] = { 0x42U };
+
+    storage_fresh();
+    card_out();
+    fake_media_set_sd_present(true);
+    ao_spy_subscribe(STORAGE_CARD_SIG);
+    ask_mount_job();
+    TEST_ASSERT_TRUE(run_sd_job());
+    TEST_ASSERT_TRUE_MESSAGE(card_last_said(true, false), "the card's mount was not told");
+
+    lp_part_round(AO_Storage, KODE_LP_PART_CARD);
+    TEST_ASSERT_TRUE(run_sd_job());
+    TEST_ASSERT_TRUE_MESSAGE(card_last_said(false, true), "the card's rest was not published as a card at rest");
+
+    post_write("shot.bmp", payload, sizeof(payload));
+    settle_card();
+    drain_write();
+    TEST_ASSERT_TRUE_MESSAGE(card_last_said(true, false), "the card's wake was not published as mounted");
+    QActive_unsubscribe(ao_spy(), STORAGE_CARD_SIG);
+}
+
+TEST_CASE("a wake that finds no card is published as no card, not at rest",
+          "[storage_ao][lowpower][card]")
+{
+    static const uint8_t payload[64] = { 0x42U };
+
+    storage_fresh();
+    card_out();
+    fake_media_set_sd_present(true);
+    ao_spy_subscribe(STORAGE_CARD_SIG);
+    ask_mount_job();
+    TEST_ASSERT_TRUE(run_sd_job());
+    TEST_ASSERT_TRUE_MESSAGE(card_last_said(true, false), "the card's mount was not told");
+    lp_part_round(AO_Storage, KODE_LP_PART_CARD);
+    TEST_ASSERT_TRUE(run_sd_job());
+    TEST_ASSERT_TRUE(card_last_said(false, true));
+
+    fake_media_set_sd_present(false);           /* taken out while its supply was off */
+    post_write("shot.bmp", payload, sizeof(payload));
+    settle_card();
+    drain_write();
+    fake_media_set_sd_present(true);
+    TEST_ASSERT_TRUE_MESSAGE(card_last_said(false, false),
+        "a card the wake did not find was still told as at rest");
+    QActive_unsubscribe(ao_spy(), STORAGE_CARD_SIG);
+}
+
+TEST_CASE("a rest with no card in the slot publishes nothing", "[storage_ao][lowpower][card]")
+{
+    storage_fresh();
+    fake_media_set_sd_present(false);
+    TEST_ASSERT_NULL(kdrv_storage_probe(KDRV_MEDIUM_SD));
+    ao_spy_subscribe(STORAGE_CARD_SIG);
+    ao_spy_drain();
+
+    lp_part_round(AO_Storage, KODE_LP_PART_CARD);
+    TEST_ASSERT_TRUE(run_sd_job());
+    fake_media_set_sd_present(true);
+    unsigned said = 0U;
+    for ( const QEvt *e = ao_spy_take(); NULL != e; e = ao_spy_take() )
+    {
+        if ( STORAGE_CARD_SIG == (enum_t)e->sig )
+        {
+            said++;
+        }
+    }
+    QActive_unsubscribe(ao_spy(), STORAGE_CARD_SIG);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, said, "a rest with no card told some news of the card");
+}
+
 /* A slot that held no card was not forgotten as tried: nothing is probed
  * again, and the write goes inside as it did before the rest. */
 TEST_CASE("after a rest with no card in the slot a bare name still goes inside", "[storage_ao][lowpower][first]")
@@ -8249,6 +8347,48 @@ TEST_CASE("a request that waits for a copy is served as soon as a download cuts 
 
 /** @brief The card's word taken back by a download, as the download module does. */
 void storage_bare_failed(void);
+
+/* ---- A replacement on the card says the card's warning as kodeOS's own --------
+ * AO_AppMgr alone asks for a replacement: it puts the copy of an app on its
+ * name. Like a data folder, a copy is said only while the card has not proved
+ * it takes a write, not once per app on every card. */
+
+/** @brief Put an old copy and its finished replacement on the card, with the log empty. */
+static void card_copy_ready(void)
+{
+    static const char OLD[] = "old";
+    static const char NEW[] = "the new copy";
+
+    fake_media_put_sd_path("app.bin", OLD, sizeof(OLD));
+    fake_media_put_sd_path("app.bin.tmp", NEW, sizeof(NEW));
+    fake_klog_reset();
+}
+
+TEST_CASE("a replacement on a card that took a write says no card warning",
+          "[storage_ao][replace][card]")
+{
+    storage_fresh();
+    TEST_ASSERT_TRUE(kdrv_sd_took_write());
+    card_copy_ready();
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, replace_answer("/sdcard/app.bin.tmp", "/sdcard/app.bin"));
+    TEST_ASSERT_FALSE_MESSAGE(log_says("on the card:"),
+        "an app's copy on a card that took a write was warned about");
+}
+
+TEST_CASE("a replacement on a card that took no write warns before it is made",
+          "[storage_ao][replace][card]")
+{
+    storage_fresh();
+    storage_bare_failed();
+    TEST_ASSERT_FALSE(kdrv_sd_took_write());
+    card_copy_ready();
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, replace_answer("/sdcard/app.bin.tmp", "/sdcard/app.bin"));
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1U, log_count("replace on the card: /sdcard/app.bin"),
+        "a copy on a card that took no write went without its warning");
+    settle_card();                             /* the remount the failure owes */
+}
 
 /* A remount owed while the copy held the handle waits for the download that
  * cut the copy to be taken: a remount begun first would refuse it. */
