@@ -38,6 +38,36 @@
  * would hold the CPU for the whole write and the interface would crawl. 10 ms
  * costs ~1.6s over a 5MB image - cheap for a UI that stays alive. */
 #define APPMGR_CHUNK_GAP_TICKS KQP_TICKS_PER_MS(10U)
+
+/* Set while a station verb times something a flash write would upset: a
+ * write off a medium holds its next chunk until it clears. */
+static volatile bool s_hold;
+
+void appmgr_hold(bool on)
+{
+    s_hold = on;
+}
+
+/* Set while the station installs: nobody is using the glass, so a write off a
+ * medium takes its next chunk at once instead of leaving the GUI a gap. */
+static volatile bool s_fast;
+
+void appmgr_fast(bool on)
+{
+    s_fast = on;
+}
+
+/** @brief The gap before the next chunk of a write off a medium. */
+static uint32_t chunk_gap(void)
+{
+    uint32_t ticks = APPMGR_CHUNK_GAP_TICKS;
+
+    if ( s_fast )
+    {
+        ticks = 1U;
+    }
+    return ticks;
+}
 /* No chunk for this long during an install and the host is presumed gone -
  * KODE_RECV_IDLE_MS (kqp_config.h) in ticks - KODE_RECV_IDLE_BLE_MS when the
  * payload rides BLE - this AO's own watchdog on the
@@ -66,6 +96,8 @@
  * the network stream's own 15 s, so a server that went quiet is reported
  * by AO_Net first, as what it is. */
 #define APPMGR_CHUNK_TICKS         KQP_TICKS_PER_MS(30000U)
+/* How many times in a row a chunk the card failed to give is read again. */
+#define APPMGR_CHUNK_AGAIN         2U
 /* Between "the image is installed" and the reset that boots it: long enough
  * for AO_Log's lower-priority task to put `>ok` on the wire first. */
 #define APPMGR_ANSWER_DRAIN_TICKS KQP_TICKS_PER_MS(50U)
@@ -191,7 +223,8 @@ static const AppFlashFailEvt s_flash_fail_evt = {
     QEVT_INITIALIZER(APP_FLASH_FAIL_SIG), (uint8_t)KFAIL_WRITE
 };
 /* An install refused for now: the card stayed busy while an app it evicts
- * was copied to it. */
+ * was copied to it, or AO_Storage had another file open when the install's
+ * own was to open. */
 static const AppFlashFailEvt s_flash_busy_fail_evt = {
     QEVT_INITIALIZER(APP_FLASH_FAIL_SIG), (uint8_t)KFAIL_BUSY
 };
@@ -297,6 +330,11 @@ typedef struct {
      * enough: the pacer would be armed twice and one buffer refilled twice. */
     uint8_t  to_return;      /**< Bitmask of buffer indices to hand back.    */
     bool     pacing;         /**< The pacer is armed; do not arm it again.   */
+    /* A chunk read from the card that comes back with an error is read again
+     * from where it starts, with the card mounted again (chunk_again()). */
+    bool     rd_card;        /**< The file being written is on the card.     */
+    uint8_t  rd_again;       /**< Reads again of the chunk now due.          */
+    uint32_t rd_off;         /**< The file's bytes delivered so far.         */
     size_t   total;
     /* What the sink has produced: kfw_produced(), or the fed length in bypass
      * mode. region_install() records it as the extent's size, and every
@@ -3375,9 +3413,18 @@ static void flash_finish(AppMgr * const me)
         /* Parked, not installed. The mailbox has no directory and what is in
          * it is a container, not an image - asking region_install() to
          * describe it produced an entry named after an offset that was never
-         * allocated, which is how this branch came to exist. */
-        KLOG_N(TAG, "parked %u bytes in the mailbox; `install src=\"pending\" "
-                    "dst=...` installs it", (unsigned)me->written);
+         * allocated, which is how this branch came to exist. The storage
+         * partition has none either: its image is the volume itself. */
+        if ( kdrv_apps_storage_sink() == me->sink )
+        {
+            KLOG_N(TAG, "wrote %u bytes into the storage partition",
+                   (unsigned)me->written);
+        }
+        else
+        {
+            KLOG_N(TAG, "parked %u bytes in the mailbox; `install src=\"pending\" "
+                        "dst=...` installs it", (unsigned)me->written);
+        }
         me->bypass = false;
         /* The card that rose for the write ends on the done, which names no
          * app: none was installed. */
@@ -3561,6 +3608,49 @@ static void hold_end(AppMgr * const me)
         hold_release(me);
         QACTIVE_PUBLISH(&s_flash_done_evt.super, &me->super);
     }
+}
+
+/**
+ * @brief Count a chunk from the card, and read a failed one again.
+ *
+ * A chunk the card failed to give is read again from where it starts, with
+ * the card mounted again (storage_reread_request()), up to
+ * APPMGR_CHUNK_AGAIN times in a row: a read that fails while the flash erases
+ * a block of an apps region already written is cut short by the card's
+ * driver, not by the card. Every buffer goes back to AO_Storage with the
+ * request, so the ones held for the pacer are let go here.
+ *
+ * @param me The AO, writing.
+ * @param d  The chunk.
+ * @return true when the chunk is to be read again and nothing else is done
+ *         with it; false when consume_chunk() takes it as it is.
+ */
+static bool chunk_again(AppMgr * const me, const StorageDataEvt *d)
+{
+    if ( (uint8_t)KODE_OK == d->status )
+    {
+        if ( !d->eof )
+        {
+            me->rd_off += (uint32_t)d->len;
+            me->rd_again = 0U;
+        }
+        return false;
+    }
+    if ( (!me->rd_card) || (APPMGR_CHUNK_AGAIN <= me->rd_again) )
+    {
+        return false;
+    }
+    me->rd_again++;
+    (void)QTimeEvt_disarm(&me->pacer);
+    me->pacing    = false;
+    me->to_return = 0U;
+    KLOG_W(TAG, "'%s': the chunk at %lu did not read; it is read again with "
+                "the card mounted again (%u of %u)", me->file,
+           (unsigned long)me->rd_off, (unsigned)me->rd_again,
+           (unsigned)APPMGR_CHUNK_AGAIN);
+    storage_reread_request(me->rd_off, &me->super);
+    (void)QTimeEvt_rearm(&me->idle, APPMGR_CHUNK_TICKS);
+    return true;
 }
 
 /**
@@ -4263,6 +4353,13 @@ static QState AppMgr_idle(AppMgr * const me, QEvt const * const e)
              * after it is the request's `run` (adopt_finish()). */
             if ( (uint8_t)KFW_SRC_PENDING == req->src_kind )
             {
+                if ( (uint8_t)KODE_FLASH_DST_STORAGE == req->dst_kind )
+                {
+                    KLOG_E(TAG, "dst=storage takes a file, not the mailbox");
+                    req_settle(me, APP_REQ_REFUSED);
+                    status = Q_HANDLED();
+                    break;
+                }
                 if ( (uint8_t)KFW_TARGET_C5 == req->dst_kind )
                 {
                     KLOG_E(TAG, "dst=c5 belongs to AO_Radio; the console routes it there");
@@ -4317,6 +4414,16 @@ static QState AppMgr_idle(AppMgr * const me, QEvt const * const e)
                 me->bypass    = true;
                 me->launch    = false;
                 me->sink      = kdrv_apps_pending_sink();
+            }
+            else if ( (uint8_t)KODE_FLASH_DST_STORAGE == req->dst_kind )
+            {
+                /* The file goes into the partition as it is, like the
+                 * mailbox's park: the sink checks the size, takes the FAT
+                 * and reads the partition back when it ends. */
+                me->os_target = false;
+                me->bypass    = true;
+                me->launch    = false;
+                me->sink      = kdrv_apps_storage_sink();
             }
             else if ( (uint8_t)KFW_TARGET_OS == req->dst_kind )
             {
@@ -4819,6 +4926,17 @@ static QState AppMgr_opening(AppMgr * const me, QEvt const * const e)
                                                 : "file not found",
                                KFAIL_WRITE);
                 }
+                else if ( (!me->from_net) && rsp->busy )
+                {
+                    /* AO_Storage has one file open, and it is someone else's
+                     * (a scene the face streams, a copy to the card): the
+                     * file may well be there, the handle is not free yet.
+                     * Its asker may ask again. */
+                    KLOG_W(TAG, "'%s' cannot open yet: the storage has another "
+                                "file open", me->file);
+                    appmgr_inst_why(APPMGR_WHY_BUSY);
+                    flash_fail(me, "the storage is busy with another file", KFAIL_BUSY);
+                }
                 else if ( me->from_net
                           && (((uint8_t)KODE_DENIED == rsp->status)
                               || ((uint8_t)KODE_NO_RESOURCES == rsp->status)) )
@@ -4854,6 +4972,9 @@ static QState AppMgr_opening(AppMgr * const me, QEvt const * const e)
             {
                 me->origin = (uint8_t)APPMGR_ORIGIN_CARD;
             }
+            me->rd_card  = (!me->from_net) && ((uint8_t)KDRV_MEDIUM_SD == rsp->medium);
+            me->rd_again = 0U;
+            me->rd_off   = 0U;
             if ( xfer_begin(me, me->os_target ? (uint8_t)KFW_TARGET_OS
                                              : (uint8_t)KFW_TARGET_APP,
                            rsp->size) != KODE_OK )
@@ -8314,6 +8435,11 @@ static QState AppMgr_flashing(AppMgr * const me, QEvt const * const e)
         case NET_STREAM_DATA_SIG: {
             StorageDataEvt const * const d = Q_EVT_CAST(StorageDataEvt);
             uint8_t const idx = d->idx;
+            if ( ((QSignal)STORAGE_DATA_SIG == e->sig) && chunk_again(me, d) )
+            {
+                status = Q_HANDLED();
+                break;
+            }
             if ( !consume_chunk(me, d) )
             {
                 if ( me->busy_pending )
@@ -8350,13 +8476,21 @@ static QState AppMgr_flashing(AppMgr * const me, QEvt const * const e)
             if ( !me->pacing )
             {
                 me->pacing = true;
-                QTimeEvt_armX(&me->pacer, APPMGR_CHUNK_GAP_TICKS, 0U);
+                QTimeEvt_armX(&me->pacer, chunk_gap(), 0U);
             }
             status = Q_HANDLED();
             break;
         }
         case APP_FLASH_CHUNK_SIG: {
-            loans_return(me);
+            if ( s_hold )
+            {
+                /* A station verb is timing something: the next chunk waits. */
+                (void)QTimeEvt_rearm(&me->pacer, APPMGR_CHUNK_GAP_TICKS);
+            }
+            else
+            {
+                loans_return(me);
+            }
             status = Q_HANDLED();
             break;
         }

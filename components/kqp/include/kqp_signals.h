@@ -672,6 +672,9 @@ enum KodeSignals {
     STORAGE_NEXT_SIG,           /**< AO_Storage: here is StorageBufEvt.idx
                                  *   back - refill it and send it again.      */
     STORAGE_CLOSE_REQ_SIG,      /**< AO_Storage: close the open file.         */
+    STORAGE_REREAD_REQ_SIG,     /**< AO_Storage: a chunk of the card file open
+                                 *   for reading failed; mount the card again
+                                 *   and read on from StorageRereadEvt.offset. */
     STORAGE_OPEN_RSP_SIG,       /**< To the opener (StorageOpenRspEvt).       */
     STORAGE_DATA_SIG,           /**< To the reader (StorageDataEvt).          */
     STORAGE_WRITE_REQ_SIG,      /**< AO_Storage: put StorageWriteEvt.data in a
@@ -1397,6 +1400,9 @@ enum KodeSignals {
                                  *   Answered to @c who with IMU_ENERGY_SIG. */
     IMU_ENERGY_SIG,             /**< To whoever asked for the drain
                                  *   (ImuEnergyEvt).                        */
+    IMU_RELEASE_REQ_SIG,        /**< AO_Imu: the holder gives back the
+                                 *   witness window it will not drain
+                                 *   (ImuCaptureReqEvt: who). No answer.     */
     IMU_TEST_REQ_SIG,           /**< AO_Imu: `test component=imu`; answers a
                                  *   published TEST_RESULT_SIG, the
                                  *   AUDIO_TEST_REQ_SIG shape. No payload.  */
@@ -1414,6 +1420,9 @@ enum KodeSignals {
                                  *   was not. This one is the QMI8658A's.   */
     MAG_REST_SIG,               /**< AO_Imu private one-shot QTimeEvt: the
                                  *   same, for the QMC5883P.                */
+    MAG_WAIT_SIG,               /**< AO_Imu private one-shot QTimeEvt: the
+                                 *   magnetometer row has waited
+                                 *   KODE_MAG_TEST_WAIT_MS for the IMU.     */
     MAG_READ_REQ_SIG,           /**< AO_Imu: one magnetometer sample into the
                                  *   caller's own int32_t[3] (MagReadEvt),
                                  *   answered inside the step that receives
@@ -1697,6 +1706,13 @@ enum KodeSignals {
                                  *   credentials (WIFI_FORGET_REQ_SIG
                                  *   forgets); nothing rejoins by itself
                                  *   until somebody asks.                    */
+    RADIO_QUIET_REQ_SIG,        /**< AO_Radio: a station's pass begins or
+                                 *   ends (RadioQuietEvt, a static event
+                                 *   each, radio_quiet_request()). While it
+                                 *   runs nothing joins a network by itself
+                                 *   and a network the board is on is left,
+                                 *   kept remembered; at its end the
+                                 *   `wifi_join` rule is back.               */
     WIFI_STATE_REQ_SIG,         /**< AO_Radio: publish WIFI_STATE_SIG now.
                                  *   Answerable in every state, link or no
                                  *   link: "not connected" is an answer.     */
@@ -1896,6 +1912,12 @@ enum KodeSignals {
                                  *   for the line it holds, or the post of
                                  *   the next line was refused and is tried
                                  *   again.                                  */
+    NET_QUIET_REQ_SIG,          /**< AO_Net (direct post, from
+                                 *   net_quiet_request()): a station's pass
+                                 *   begins or ends (NetQuietEvt, a static
+                                 *   event each). While it runs a request
+                                 *   that starts network work is refused and
+                                 *   the Kode channel does not start.        */
     NET_LEAVE_REQ_SIG,          /**< AO_Net (private, direct post, from
                                  *   net_leave_request()): leave the Kode
                                  *   channel cleanly and start no new session
@@ -2205,6 +2227,10 @@ enum KodeSignals {
     TEST_DOT_DRAIN_SIG,         /**< AO_TestDot private QTimeEvt, one-shot:
                                  *   post the records the console's queue
                                  *   refused.                                 */
+    TEST_DOT_QUIET_SIG,         /**< AO_TestDot private QTimeEvt, one-shot:
+                                 *   a station's pass with no verb for
+                                 *   KODE_TEST_DOT_QUIET_IDLE_MS, or a quiet
+                                 *   AO_Radio or AO_Net had no room for.      */
 
     MAX_SIG                   /**< First value free for a consumer's own
                                  *   private signals: kgui numbers its from
@@ -2401,7 +2427,8 @@ typedef enum {
     KFAIL_WRITE = 0,  /**< The write itself: the image, the medium, the flash. */
     KFAIL_BUSY,       /**< Nothing was written: the card stayed busy while
                        *   an app this install would remove was copied to
-                       *   it. Ask again.                                     */
+                       *   it, or AO_Storage had another file open when the
+                       *   install's own was to open. Ask again.              */
     KFAIL_DATA,       /**< An app's data folder did not come or could not be
                        *   written. No app was installed or touched: the
                        *   folder is how an app looks, never what lets it
@@ -2444,7 +2471,7 @@ typedef struct {
 /** @brief What AO_AppMgr made of a request that asked for a verdict (AppReqRspEvt.verdict). */
 typedef enum {
     APP_REQ_TAKEN = 0,   /**< Taken: the install is under way, or the app is on its way to boot. */
-    APP_REQ_BUSY,        /**< AO_AppMgr has work in hand: ask again.                           */
+    APP_REQ_BUSY,        /**< AO_AppMgr has work in hand, or AO_Storage another file: ask again. */
     APP_REQ_MISSING,     /**< The file is not on the medium, or the app is not installed.      */
     APP_REQ_EMPTY,       /**< The mailbox holds nothing to install.                            */
     APP_REQ_REFUSED      /**< Refused for another reason, which the log gives.                 */
@@ -2817,6 +2844,8 @@ typedef struct {
     uint32_t size;
     uint8_t  status;    /**< kode_status_t                                    */
     uint8_t  medium;    /**< Where it was found.                              */
+    bool     busy;      /**< Refused because AO_Storage has another file open:
+                         *   the asker may ask again once it is closed.       */
 } StorageOpenRspEvt;
 
 /** @brief A borrowed buffer being handed back (STORAGE_NEXT_SIG). */
@@ -2824,6 +2853,21 @@ typedef struct {
     QEvt    super;
     uint8_t idx;
 } StorageBufEvt;
+
+/**
+ * @brief Read the open card file again from @c offset (STORAGE_REREAD_REQ_SIG).
+ *
+ * The answer is the read itself: every buffer comes back to AO_Storage, which
+ * mounts the card again, opens the same file, moves to @c offset and sends up
+ * to two chunks from there, as an open followed by two read requests would.
+ * When any of that fails the answer is one STORAGE_DATA_SIG with an error and
+ * the file is closed.
+ */
+typedef struct {
+    QEvt     super;
+    uint32_t offset;    /**< The file's byte the next chunk starts at.        */
+    QActive *who;       /**< The reader that asks: the one with the file open. */
+} StorageRereadEvt;
 
 /**
  * @brief A chunk of the open file (STORAGE_DATA_SIG).
@@ -4848,6 +4892,18 @@ typedef struct {
     bool on;     /**< true: no power save; false: the default back.         */
 } WifiFastEvt;
 
+/** @brief What NET_QUIET_REQ_SIG carries: the pass, a static event each. */
+typedef struct {
+    QEvt super;
+    bool on;     /**< true: a station's pass begins; false: it is over.     */
+} NetQuietEvt;
+
+/** @brief What RADIO_QUIET_REQ_SIG carries: the pass, a static event each. */
+typedef struct {
+    QEvt super;
+    bool on;     /**< true: a station's pass begins; false: it is over.     */
+} RadioQuietEvt;
+
 /** @brief What EXP_POWER_REQ_SIG carries: the wish, a static event each. */
 typedef struct {
     QEvt super;
@@ -6723,6 +6779,10 @@ typedef struct {
                                    *   flags say which half stopped it:
                                    *   HAPTIC_TF_MUTE, HAPTIC_TF_SHORT or
                                    *   HAPTIC_TF_LOUD.                      */
+#define HAPTIC_TEST_CYCLE     4U  /**< the pattern row, one cycle: step is the
+                                   *   cycle, on_x10 its "on" window, floor_x10
+                                   *   the louder neighbouring "off" window,
+                                   *   ratio_x10; PASS or none.             */
 
 /* Bits of HapticTestEvt.flags. */
 #define HAPTIC_TF_PASS    0x01U  /**< This record's own verdict.            */
@@ -7718,6 +7778,7 @@ typedef enum {
     TEST_DOT_VERB_END,      /**< `test_dot_end`.                       */
     TEST_DOT_VERB_INFO,     /**< `test_dot_info`.                      */
     TEST_DOT_VERB_CAMERA,   /**< `test_dot_camera`.                    */
+    TEST_DOT_VERB_BRIGHT,   /**< `test_dot_bright` (bench).            */
     TEST_DOT_VERBS          /**< How many.                             */
 } test_dot_verb_t;
 
@@ -7768,6 +7829,7 @@ typedef struct {
         bool    on;            /**< TEST_DOT_VERB_BOOST: the boost on.            */
         bool    pass;          /**< TEST_DOT_VERB_RESULT: the verdict.           */
         uint8_t cam;           /**< TEST_DOT_VERB_CAMERA: test_dot_cam_t.        */
+        uint8_t pct;           /**< TEST_DOT_VERB_BRIGHT: the glass's level, %.  */
     } a;               /**< The verb's keys, already checked by the console.    */
 } TestDotReqEvt;
 
