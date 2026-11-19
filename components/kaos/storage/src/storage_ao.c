@@ -4611,7 +4611,8 @@ static void answer_path_stat(QActive *who, uint8_t op, const char *path)
  * was tried. A spare line is cheap. Keep it here, in the card's owner, not in
  * the driver or the console: writes nobody typed (`install dst=app`) pass
  * through here too. The data folders and the apps' copies, which kodeOS places
- * itself, call warn_if_unproven_card() instead.
+ * itself, call warn_if_unproven_card() instead, and so do the changes the file
+ * calls ask for, through warn_change().
  *
  * @param verb What is about to be attempted, as an operator would name it -
  *             "mkdir", "rm", "mv", "write". It goes on the wire verbatim, so
@@ -4646,16 +4647,43 @@ static void warn_if_unproven_card(const char *verb, const char *path)
 }
 
 /**
+ * @brief The card's warning for the request in hand, as its asker calls for.
+ *
+ * A request made through kode_sys's file calls - an Active Object's ask or an
+ * app task's wait - is a change kodeOS or an app chose, like a data folder:
+ * the launcher saves its list in some twenty writes. It is said only while the
+ * card has not proved it takes a write. A console verb is said every time.
+ * Reads the requester reply_set() noted, so it is called before reply_clear().
+ *
+ * @param verb As warn_if_card() takes it.
+ * @param path As warn_if_card() takes it.
+ */
+static void warn_change(const char *verb, const char *path)
+{
+    if ( (NULL != s_ask_who) || (NULL != s_waiter) )
+    {
+        warn_if_unproven_card(verb, path);
+    }
+    else
+    {
+        warn_if_card(verb, path);
+    }
+}
+
+/**
  * @brief Answer a STORAGE_PATH_MKDIR request.
  *
  * One level: kdrv_storage_mkdir() itself has no `-p`, and neither does this -
  * a missing parent comes back as KODE_ERROR unchanged, not silently repaired.
+ * A name already taken is answered as KODE_EXISTS and not said as a failure:
+ * a folder that is there is what the asker wanted, and the console says
+ * `exists` itself.
  */
 static void answer_path_mkdir(QActive *who, uint8_t op, const char *path)
 {
-    warn_if_card("mkdir", path);
+    warn_change("mkdir", path);
     kode_status_t const rc = kdrv_storage_mkdir(path);
-    if ( KODE_OK != rc )
+    if ( (KODE_OK != rc) && (KODE_EXISTS != rc) )
     {
         KLOG_W(TAG, "mkdir '%s' failed", path);
     }
@@ -4671,11 +4699,11 @@ static void answer_path_mkdir(QActive *who, uint8_t op, const char *path)
  *
  * The console's STAT phase has already said @p path is a file, but
  * kdrv_storage_unlink() checks again for callers that skip it.
- * warn_if_card() fires first, whether or not the delete reaches remove().
+ * warn_change() fires first, whether or not the delete reaches remove().
  */
 static void answer_path_unlink(QActive *who, uint8_t op, const char *path)
 {
-    warn_if_card("rm", path);
+    warn_change("rm", path);
     kode_status_t const rc = kdrv_storage_unlink(path);
     if ( KODE_OK != rc )
     {
@@ -4692,7 +4720,7 @@ static void answer_path_unlink(QActive *who, uint8_t op, const char *path)
  */
 static void answer_path_rmdir(QActive *who, uint8_t op, const char *path)
 {
-    warn_if_card("rmdir", path);
+    warn_change("rmdir", path);
     kode_status_t const rc = kdrv_storage_rmdir(path);
     if ( KODE_OK != rc )
     {
@@ -4753,14 +4781,14 @@ static bool pair_src_missing(const char *src)
 /**
  * @brief Answer a STORAGE_PAIR_REQ_SIG move.
  *
- * warn_if_card() fires on @p dst before the rename, even one about to be
+ * warn_change() fires on @p dst before the rename, even one about to be
  * refused for crossing volumes. On a KODE_ERROR, `exists` in the response says
  * whether pair_src_missing() found the source missing.
  */
 static void answer_pair_move(QActive *who, uint8_t op, const char *src,
                              const char *dst)
 {
-    warn_if_card("mv", dst);
+    warn_change("mv", dst);
     kode_status_t const rc = kdrv_storage_rename(src, dst);
     bool                src_missing = false;
     if ( KODE_OK != rc )
@@ -5023,7 +5051,7 @@ static void answer_text_write(Storage * const me, QActive *who, uint8_t op,
         return;
     }
 
-    warn_if_card("write", path);
+    warn_change("write", path);
     kode_status_t rc = kdrv_storage_create_path(path, append);
 
     if ( KODE_OK == rc )
