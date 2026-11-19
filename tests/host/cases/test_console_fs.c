@@ -1686,6 +1686,45 @@ TEST_CASE("write line= against a zero-byte file answers noline, not path",
         ">|path=\"/storage/empty.txt\" type=file size=0 medium=fs"));
 }
 
+/* kode-sdk#222: on the board FatFs refuses such a name, and `stat` answered
+ * `volume` and `write` `iofail` for it, blaming a healthy volume. The name
+ * is the value that is wrong, so every verb says `path`; `write line=`
+ * included, which must not read the refusal as an empty file. */
+TEST_CASE("a name FAT will not take is a bad path for every verb",
+          "[console_fs]")
+{
+    static const char *const lines[] = {
+        "stat path=\"/storage/a\\\"b\"",
+        "write path=\"/storage/a\\\"b\" text=\"x\"",
+        "write path=\"/storage/a\\\"b\" line=1 text=\"x\"",
+        "mkdir path=\"/storage/a:b\"",
+        "mv src=\"/storage/notes.txt\" dst=\"/storage/a?b\"",
+        "cp src=\"/storage/a|b\" dst=\"/storage/c.txt\"",
+        "cat path=\"/storage/a*b\"",
+        "rm path=\"/storage/a<b\"",
+        "ls path=\"/storage/a>b\"",
+    };
+
+    console_up_once();
+    fake_media_put_fs_file("notes.txt", "hello");
+
+    for ( size_t i = 0U; (sizeof(lines) / sizeof(lines[0])) > i; ++i )
+    {
+        fake_klog_reset();
+        type_line(lines[i]);
+        settle();
+        settle();
+        TEST_ASSERT_TRUE_MESSAGE(replied_line(">err code=3 msg=path"), lines[i]);
+    }
+
+    /* Nothing was moved: the file the refused `mv` named is still there. */
+    fake_klog_reset();
+    type_line("stat path=\"/storage/notes.txt\"");
+    settle();
+    TEST_ASSERT_TRUE(replied_line(
+        ">|path=\"/storage/notes.txt\" type=file size=5 medium=fs"));
+}
+
 /* A line replaced with something longer than the line it stood for can push
  * the REBUILT file over the ceiling even when the file this read started
  * from sat exactly AT it - answer_text_line_write()'s second STORAGE_CHUNK
