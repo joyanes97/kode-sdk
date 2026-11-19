@@ -4,6 +4,7 @@
  * @brief NimBLE on the P4, driving the controller that lives on the C5.
  */
 #include "kdrv_ble.h"
+#include "kdrv_ble_own.h"     /* the board's own address: which one, and its shape */
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -3601,26 +3602,173 @@ static void ble_cccd_prune(void)
 }
 #endif /* CONFIG_KODEOS_BLE_CONSOLE */
 
+/**
+ * @brief Keep @p a as the address on the air, for kdrv_ble_addr().
+ * @param a The six bytes, in NimBLE's order.
+ */
+static void ble_own_note(const uint8_t *a)
+{
+    /* NimBLE keeps addresses little-endian; everyone who reads one expects
+     * the other order, so it is turned here rather than at each of the places
+     * that print it. */
+    for ( uint32_t i = 0U; KDRV_BLE_OWN_LEN > i; ++i )
+    {
+        s_ble.addr[i] = a[(KDRV_BLE_OWN_LEN - 1U) - i];
+    }
+}
+
+/**
+ * @brief Draw a new random static address and keep it in NVS.
+ * @param a Out: the six bytes, in NimBLE's order.
+ * @return true when it is kept. An address NVS refused is not to be used: the
+ *         next start would draw another under the bonds made meanwhile.
+ */
+static bool ble_own_draw(uint8_t *a)
+{
+    esp_fill_random(a, KDRV_BLE_OWN_LEN);
+    kdrv_ble_own_static(a);
+    return khal_nvs_set_blob(KDRV_BLE_OWN_NVS_NS, KDRV_BLE_OWN_NVS_KEY, a,
+                             KDRV_BLE_OWN_LEN) == KODE_OK;
+}
+
+/**
+ * @brief Advertise, scan and connect from the random static address @p a.
+ * @param a The six bytes, in NimBLE's order.
+ * @return true when the controller took it; it refuses while an advert or a
+ *         scan is on.
+ */
+static bool ble_own_use(const uint8_t *a)
+{
+    bool const ok = (ble_hs_id_set_rnd(a) == 0);
+
+    if ( ok )
+    {
+        s_ble.own_addr_type = BLE_OWN_ADDR_RANDOM;
+        ble_own_note(a);
+    }
+    return ok;
+}
+
+/**
+ * @brief The word the start's log line gives for the address chosen.
+ * @param own The choice.
+ * @return "stored", "new" or "public".
+ */
+static const char *ble_own_word(kdrv_ble_own_t own)
+{
+    const char *word = "public";
+
+    if ( KDRV_BLE_OWN_STORED == own )
+    {
+        word = "stored";
+    }
+    else if ( KDRV_BLE_OWN_NEW == own )
+    {
+        word = "new: nobody is bonded";
+    }
+    else
+    {
+        /* public */
+    }
+    return word;
+}
+
+/**
+ * @brief Choose the address the board advertises, at every sync of the host.
+ *
+ * The one kept in NVS; while none is kept, the public one as long as anybody
+ * is bonded (the address those phones know), else a new one, kept before it
+ * is used.
+ */
+static void ble_own_choose(void)
+{
+    uint8_t a[KDRV_BLE_OWN_LEN];
+    size_t  len   = sizeof(a);
+    int     bonds = 0;
+
+    bool const stored = (khal_nvs_get_blob(KDRV_BLE_OWN_NVS_NS, KDRV_BLE_OWN_NVS_KEY,
+                                           a, &len) == KODE_OK)
+                     && (sizeof(a) == len) && kdrv_ble_own_valid(a);
+
+    if ( ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &bonds) != 0 )
+    {
+        /* Unknown is counted as bonded: the public address puts no phone's
+         * bond at risk. */
+        bonds = 1;
+    }
+    kdrv_ble_own_t own = kdrv_ble_own_pick(stored, (uint32_t)bonds);
+
+    if ( (KDRV_BLE_OWN_NEW == own) && !ble_own_draw(a) )
+    {
+        KLOG_W(TAG, "address: a new one could not be kept; the public one");
+        own = KDRV_BLE_OWN_PUBLIC;
+    }
+    if ( (KDRV_BLE_OWN_PUBLIC != own) && !ble_own_use(a) )
+    {
+        KLOG_W(TAG, "address: the controller refused the random one; the public one");
+        own = KDRV_BLE_OWN_PUBLIC;
+    }
+    if ( KDRV_BLE_OWN_PUBLIC == own )
+    {
+        uint8_t pub[KDRV_BLE_OWN_LEN];
+
+        if ( ble_hs_id_infer_auto(0, &s_ble.own_addr_type) != 0 )
+        {
+            s_ble.own_addr_type = BLE_OWN_ADDR_PUBLIC;
+        }
+        if ( ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, pub, NULL) == 0 )
+        {
+            ble_own_note(pub);
+        }
+    }
+    KLOG_I(TAG, "address %02x:%02x:%02x:%02x:%02x:%02x (%s)",
+           s_ble.addr[0], s_ble.addr[1], s_ble.addr[2],
+           s_ble.addr[3], s_ble.addr[4], s_ble.addr[5], ble_own_word(own));
+}
+
+/**
+ * @brief Every bond is gone: a new address, kept and put on the air at once.
+ *
+ * A phone that keeps its half of a bond the board lost meets a stranger
+ * under the new address and pairs from zero, with nothing to forget by hand.
+ * The controller takes no new random address while an advert is on, so the
+ * advert comes off first; AO_Radio puts it back when the unpair is answered.
+ * Refused there (a scan on), the address is kept and the next start uses it.
+ */
+static void ble_own_renew(void)
+{
+    uint8_t a[KDRV_BLE_OWN_LEN];
+
+    if ( !ble_own_draw(a) )
+    {
+        KLOG_W(TAG, "address: a new one could not be kept; the board keeps its own");
+    }
+    else
+    {
+        if ( KDRV_BLE_ADVERTISING == s_ble.state )
+        {
+            (void)kdrv_ble_advertise(false);
+        }
+        if ( ble_own_use(a) )
+        {
+            KLOG_N(TAG, "address: every bond is gone; the board is now "
+                        "%02x:%02x:%02x:%02x:%02x:%02x",
+                   s_ble.addr[0], s_ble.addr[1], s_ble.addr[2],
+                   s_ble.addr[3], s_ble.addr[4], s_ble.addr[5]);
+        }
+        else
+        {
+            KLOG_W(TAG, "address: the controller refused the new one now; "
+                        "it is kept for the next start");
+        }
+    }
+}
+
 /** @brief The controller answered: from here the stack knows its own address. */
 static void ble_on_sync(void)
 {
     (void)ble_hs_util_ensure_addr(0);
-    if ( ble_hs_id_infer_auto(0, &s_ble.own_addr_type) != 0 )
-    {
-        s_ble.own_addr_type = BLE_OWN_ADDR_PUBLIC;
-    }
-
-    uint8_t a[6];
-    if ( ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, a, NULL) == 0 )
-    {
-        /* NimBLE keeps addresses little-endian; everyone who reads one
-         * expects the other order, so it is turned here rather than at each
-         * of the places that print it. */
-        for ( uint8_t i = 0U; 6U > i; ++i )
-        {
-            s_ble.addr[i] = a[5U - i];
-        }
-    }
+    ble_own_choose();
 #if CONFIG_KODEOS_BLE_CONSOLE
     ble_store_hook();
 #if CONFIG_KODEOS_BLE_CONSOLE_PAIRING
@@ -5021,7 +5169,14 @@ kode_status_t kdrv_ble_unpair(void)
     (void)memset(&s_hid_hosts, 0, sizeof(s_hid_hosts));
     kdrv_ble_hid_hosts_store(&s_hid_hosts);
 #endif
-    return (ble_store_clear() == 0) ? KODE_OK : KODE_ERROR;
+    if ( ble_store_clear() != 0 )
+    {
+        return KODE_ERROR;
+    }
+    /* Every phone that was bonded keeps its half: under a new address it
+     * meets a stranger and pairs from zero. */
+    ble_own_renew();
+    return KODE_OK;
 }
 
 /**
