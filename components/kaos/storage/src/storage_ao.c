@@ -5114,11 +5114,14 @@ static void answer_text_line_write(Storage * const me, QActive *who,
     kode_status_t rc   = kdrv_storage_open_path(path, &size);
     if ( KODE_OK != rc )
     {
-        /* KODE_DENIED with size 0 on a path naming a real volume is an
-         * empty file: answered as `noline`, like a line past the end.
-         * A path naming no volume stays a bad path. */
+        /* KODE_DENIED with size 0 on a file that is there is an empty
+         * file: answered as `noline`, like a line past the end. A
+         * malformed path (a name FAT will not take among them) or one
+         * naming no volume stays a bad path. */
+        kdrv_stat_t st = { .exists = false, .is_dir = false, .size = 0U };
         if ( (KODE_DENIED == rc) && (0U == size)
-            && (kdrv_storage_medium_of(path) != KDRV_MEDIUM_COUNT) )
+            && (kdrv_storage_stat(path, &st) == KODE_OK) && st.exists
+            && !st.is_dir )
         {
             KLOG_W(TAG, "write '%s' line=%u: file is empty, no line to "
                         "replace", path, (unsigned)line);

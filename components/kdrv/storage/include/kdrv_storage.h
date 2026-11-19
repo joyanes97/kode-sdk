@@ -86,6 +86,12 @@ void kdrv_storage_dump(kdrv_medium_t m);
  * and "/storage/..." - mapped onto whichever volume they actually name.
  * kdrv_storage_stat() is the first path function; every one that follows it
  * shares the same mapping, so this is the contract they all read against.
+ *
+ * A malformed path, refused with KODE_DENIED by every function here before
+ * anything is touched, is one that is not absolute, has an empty component,
+ * a "." or a "..", ends in a separator (the root aside), or holds a name FAT
+ * will not take: a control character, DEL or one of " * : < > ? | \ in it,
+ * or nothing but dots and spaces.
  */
 
 /**

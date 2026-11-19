@@ -217,18 +217,54 @@ kdrv_medium_t kdrv_storage_medium_of(const char *vpath)
     return KDRV_MEDIUM_COUNT;
 }
 
+/** @brief Bytes below this are control characters. FatFs ends a path at one
+ *         and keeps the name up to it, so the rest would be dropped unsaid. */
+#define VPATH_FIRST_PRINTABLE  0x20U
+/** @brief DEL, the one control character above the printable range; FatFs
+ *         refuses it. */
+#define VPATH_DEL              0x7FU
+/** @brief The printable characters FatFs refuses in a name, and '\\', which
+ *         it reads as a separator. */
+#define VPATH_REFUSED          "\"*:<>?|\\"
+
+/**
+ * @brief Whether FAT refuses @p c in a name, or reads it as something else.
+ *
+ * FatFs's own rule (create_name() in ff.c, R0.16): it refuses DEL and the
+ * characters in VPATH_REFUSED, reads '\\' as a separator, and stops the path
+ * at a control character, keeping the name up to it.
+ *
+ * @param c One byte of a name; never '/' or the terminator.
+ * @return true when a name holding it is refused.
+ */
+static bool vpath_char_refused(char c)
+{
+    unsigned char const u = (unsigned char)c;
+
+    return (VPATH_FIRST_PRINTABLE > u) || (VPATH_DEL == u)
+           || (NULL != strchr(VPATH_REFUSED, (int)u));
+}
+
 /**
  * @brief Is @p vpath the absolute, normalised shape this layer promises?
  *
  * The header states the contract - absolute, no ".", no "..", no empty
- * component, no trailing separator except the root - and this is where it is
- * enforced, in the one function every path call already goes through. It was
- * a contract nothing checked: the console's own resolver normalises before it
- * asks, so the console could never break it, but the facade hands an app's
- * string straight down, and "/storage/../.." would have been walked out
- * of the tree by libc without anything in kodeOS objecting. Checking it here
- * rather than at each door means a caller that arrives later is covered by
- * construction instead of by remembering.
+ * component, no trailing separator except the root, no name FAT will not
+ * take - and this is where it is enforced, in the one function every path
+ * call already goes through. It was a contract nothing checked: the console's
+ * own resolver normalises before it asks, so the console could never break
+ * it, but the facade hands an app's string straight down, and
+ * "/storage/../.." would have been walked out of the tree by libc without
+ * anything in kodeOS objecting. Checking it here rather than at each door
+ * means a caller that arrives later is covered by construction instead of by
+ * remembering.
+ *
+ * A name FAT will not take is refused here for the same reason. FatFs answers
+ * it with FR_INVALID_NAME, which reaches this file as EINVAL, a failure the
+ * callers cannot tell from a card that will not answer; refused here, the
+ * caller hears that the path is wrong. A name of dots and spaces alone is one
+ * of them (FatFs strips trailing dots and spaces, and nothing is left), and
+ * that one rule also covers ".", ".." and the empty component.
  *
  * @param vpath The virtual path. NULL is not accepted; callers check first.
  * @return true when the path may be mapped.
@@ -244,33 +280,32 @@ static bool vpath_is_canonical(const char *vpath)
         return true;
     }
 
-    size_t const len = strlen(vpath);
-    if ( '/' == vpath[len - 1U] )
-    {
-        return false;
-    }
-
-    size_t start = 1U;
+    size_t const len   = strlen(vpath);
+    bool         blank = true;  /* the name so far is dots and spaces only */
     for ( size_t i = 1U; i <= len; ++i )
     {
-        if ( ('/' != vpath[i]) && ('\0' != vpath[i]) )
+        char const c = vpath[i];
+
+        if ( ('/' == c) || ('\0' == c) )
         {
-            continue;
+            if ( blank )
+            {
+                return false;
+            }
+            blank = true;
         }
-        size_t const n = i - start;
-        if ( 0U == n )
-        {
-            return false;
-        }
-        if ( (1U == n) && ('.' == vpath[start]) )
-        {
-            return false;
-        }
-        if ( (2U == n) && ('.' == vpath[start]) && ('.' == vpath[start + 1U]) )
+        else if ( vpath_char_refused(c) )
         {
             return false;
         }
-        start = i + 1U;
+        else if ( ('.' != c) && (' ' != c) )
+        {
+            blank = false;
+        }
+        else
+        {
+            /* a dot or a space: the name stays as blank as it was */
+        }
     }
     return true;
 }

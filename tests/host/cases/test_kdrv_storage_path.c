@@ -165,6 +165,58 @@ TEST_CASE("a path that is not normalised is refused", "[kdrv_storage_path]")
     TEST_ASSERT_TRUE(st.exists);
 }
 
+/* The host's own file system takes every one of these names, so without the
+ * check they would pass here and fail only on the board, where FatFs refuses
+ * them and the caller cannot tell the refusal from a dead card. */
+TEST_CASE("a name FAT will not take is refused before anything is touched",
+          "[kdrv_storage_path]")
+{
+    static const char *const refused[] = {
+        "/storage/a\"b", "/storage/a*b", "/storage/a:b", "/storage/a<b",
+        "/storage/a>b", "/storage/a?b", "/storage/a|b", "/storage/a\\b",
+        "/storage/a\x7f" "b", "/storage/a\x01" "b", "/storage/a\tb",
+        "/storage/...", "/storage/ ", "/storage/. .", "/storage/x/ /y",
+        "/sdcard/a?b",
+    };
+    kdrv_stat_t st;
+    uint32_t    size = 0U;
+
+    storage_fresh();
+    fake_media_put_fs_file("notes.txt", "hello");
+
+    for ( size_t i = 0U; (sizeof(refused) / sizeof(refused[0])) > i; ++i )
+    {
+        TEST_ASSERT_EQUAL_INT_MESSAGE(KODE_DENIED,
+                                      kdrv_storage_stat(refused[i], &st),
+                                      refused[i]);
+    }
+
+    /* Every door, not the stat alone: the write, the folder, the rename's
+     * two ends and the read all refuse it the same way. */
+    TEST_ASSERT_EQUAL_INT(KODE_DENIED,
+                          kdrv_storage_create_path("/storage/a\"b", false));
+    TEST_ASSERT_EQUAL_INT(KODE_DENIED, kdrv_storage_mkdir("/storage/a:b"));
+    TEST_ASSERT_EQUAL_INT(KODE_DENIED,
+                          kdrv_storage_rename("/storage/notes.txt",
+                                              "/storage/a?b"));
+    TEST_ASSERT_EQUAL_INT(KODE_DENIED,
+                          kdrv_storage_rename("/storage/a|b",
+                                              "/storage/c.txt"));
+    TEST_ASSERT_EQUAL_INT(KODE_DENIED,
+                          kdrv_storage_open_path("/storage/a<b", &size));
+
+    /* Dots and spaces inside a name are a name like any other. */
+    fake_media_put_fs_dir(".kode");
+    fake_media_put_fs_file("my notes.txt", "x");
+    (void)memset(&st, 0, sizeof(st));
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kdrv_storage_stat("/storage/.kode", &st));
+    TEST_ASSERT_TRUE(st.is_dir);
+    (void)memset(&st, 0, sizeof(st));
+    TEST_ASSERT_EQUAL_INT(KODE_OK,
+                          kdrv_storage_stat("/storage/my notes.txt", &st));
+    TEST_ASSERT_TRUE(st.exists);
+}
+
 TEST_CASE("a path naming no volume is refused", "[kdrv_storage_path]")
 {
     kdrv_stat_t st;
