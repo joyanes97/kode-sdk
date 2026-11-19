@@ -40,8 +40,11 @@ idf_component_register(
 # reach for has to exist. esp_netif_sntp.h sizes its server list from
 # CONFIG_LWIP_SNTP_MAX_SERVERS, which the linux target's sdkconfig does not
 # define at all - the header does not fail soft, it fails to compile.
+# The same holds for the check of a certificate's dates: kdrv_net refuses to
+# compile without it, and the definition says what the board file says.
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=1"
+    "CONFIG_MBEDTLS_HAVE_TIME_DATE=1"
     "CONFIG_LWIP_SNTP_MAX_SERVERS=1")
 
 # Sanitizers, only when KODE_SANITIZE is set; see tests/sanitize.cmake.

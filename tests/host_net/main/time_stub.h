@@ -6,6 +6,7 @@
 #ifndef TIME_STUB_H_
 #define TIME_STUB_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /**
@@ -19,5 +20,12 @@ void time_stub_set_ms(uint32_t ms);
  * @param ms Milliseconds to add.
  */
 void time_stub_advance_ms(uint32_t ms);
+
+/**
+ * @brief Set the wall clock as kdrv_clocks reports it.
+ * @param iso    What kdrv_clocks_wall_iso() writes; NULL for a clock not set.
+ * @param approx What kdrv_clocks_wall_approx() reports.
+ */
+void time_stub_set_wall(const char *iso, bool approx);
 
 #endif /* TIME_STUB_H_ */

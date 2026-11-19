@@ -16,6 +16,7 @@
 #include "khal_identity.h"
 #include "khal_system.h"
 #include "khal_time.h"
+#include "kdrv_clocks.h"
 #include "kode_log.h"
 
 #include "freertos/FreeRTOS.h"
@@ -27,6 +28,7 @@
 #include "esp_netif_sntp.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "mbedtls/x509.h"
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -47,6 +49,15 @@
 
 #if !defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
 #error "KODEOS_NET verifies https:// against the Mozilla bundle: enable CONFIG_MBEDTLS_CERTIFICATE_BUNDLE (kodeOS pins it in sdkconfig.defaults)"
+#endif
+
+/* mbedTLS reads a certificate's dates only with this option, which ESP-IDF
+ * leaves off: without it an expired certificate is accepted. A generated
+ * sdkconfig keeps the value it was made with over any new default, so a
+ * project made before the board file said so would build without the check.
+ * It finds out here instead. */
+#if !defined(CONFIG_MBEDTLS_HAVE_TIME_DATE)
+#error "KODEOS_NET checks a certificate's dates: read sdk/components/kbsp/sdkconfig.board before your own sdkconfig defaults (CONFIG_MBEDTLS_HAVE_TIME_DATE=y), and delete a generated sdkconfig that says it is not set"
 #endif
 
 /* mbedTLS allocates in PSRAM. Its default is the internal pool, and an MQTT
@@ -112,6 +123,8 @@
 #define NET_PUT_SCHEME        "https://"
 /** What a log line names when the URL's host cannot be cut out of it. */
 #define NET_HOST_UNKNOWN      "?"
+/** Room for the clock as kdrv_clocks_wall_iso() writes it, terminator included. */
+#define NET_CLOCK_TEXT_MAX    21U
 /** The header value's scheme word, space included. */
 #define NET_AUTH_SCHEME       "Bearer "
 /** ESP-IDF's HTTP client's log tag. At DEBUG it writes a request's headers
@@ -523,6 +536,72 @@ static uint32_t stream_time_left(uint32_t t0, uint32_t cap_ms)
     return left;
 }
 
+/**
+ * @brief Say that a server's certificate was refused, and what the clock read.
+ *
+ * mbedTLS judges a certificate's dates against the wall clock, so a wrong clock
+ * refuses a good certificate as surely as a bad certificate is refused. The
+ * line names the clock; "could not open" alone reads as a dead server.
+ *
+ * The line cannot say why. esp-tls keeps the verify flags only while mbedTLS
+ * still holds the peer's certificate, and after a refused first handshake it
+ * holds none: the flags always read 0 there. The error code is kept.
+ *
+ * @param stack_err The TLS stack's last error, as esp-tls keeps it (mbedTLS's
+ *                  code negated); anything but a refused certificate says
+ *                  nothing.
+ * @param url       The address asked; the line names its host alone.
+ */
+static void net_cert_refused_say(int stack_err, const char *url)
+{
+    if ( (-MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) == stack_err )
+    {
+        char        host[KDRV_NET_HOST_MAX];
+        char        clock[NET_CLOCK_TEXT_MAX];
+        const char *reads  = "reads ";
+        const char *source = "";
+
+        if ( kdrv_net_url_host(url, host, sizeof(host)) != KODE_OK )
+        {
+            (void)snprintf(host, sizeof(host), "%s", NET_HOST_UNKNOWN);
+        }
+        if ( kdrv_clocks_wall_iso(clock, sizeof(clock)) != KODE_OK )
+        {
+            reads = "is not set";
+            clock[0] = '\0';
+        }
+        else if ( kdrv_clocks_wall_approx() )
+        {
+            source = ", put back after a power cut";
+        }
+        else
+        {
+            /* Set by the network or by a person. */
+        }
+        KLOG_W(TAG, "%s: its certificate was refused; the clock %s%s%s", host,
+               reads, clock, source);
+    }
+}
+
+/**
+ * @brief After a request that could not be sent: say whether the server's
+ *        certificate was refused (net_cert_refused_say()).
+ *
+ * @param h   The client the request failed on, before its cleanup.
+ * @param url The address asked.
+ */
+static void net_http_cert_say(esp_http_client_handle_t h, const char *url)
+{
+    int tls_code  = 0;
+    int tls_flags = 0;
+
+    /* What it returns is the last error itself, not whether it could be read:
+     * after a refused handshake it is never ESP_OK. The code stays 0 when
+     * nothing was kept. */
+    (void)esp_http_client_get_and_clear_last_tls_error(h, &tls_code, &tls_flags);
+    net_cert_refused_say(tls_code, url);
+}
+
 /** @brief The open stream's Content-Range, kept by its event hook: one stream at a time. */
 static net_range_t s_stream_range;
 
@@ -583,6 +662,7 @@ kode_status_t kdrv_net_stream_open(const char *url, uint32_t offset,
     if ( esp_http_client_open(h, 0) != ESP_OK )
     {
         KLOG_W(TAG, "GET %.*s: could not open", shown, url);
+        net_http_cert_say(h, url);
         esp_http_client_cleanup(h);
         return KODE_ERROR;
     }
@@ -956,6 +1036,7 @@ static kode_status_t http_exchange(const char *url,
     if ( ESP_OK != err )
     {
         KLOG_W(TAG, "%s %s: %s", verb, shown, esp_err_to_name(err));
+        net_http_cert_say(h, url);
         rc = KODE_ERROR;
     }
     else
@@ -1612,6 +1693,11 @@ static void mqtt_event(void *args, esp_event_base_t base, int32_t id,
                 s_mqtt.err_key = key;
                 KLOG_E(TAG, "mqtt error from %s (refused code %d)", s_mqtt.uri,
                        refused);
+                if ( NULL != ev->error_handle )
+                {
+                    net_cert_refused_say(ev->error_handle->esp_tls_stack_err,
+                                         s_mqtt.uri);
+                }
             }
             if ( 0 != refused )
             {
