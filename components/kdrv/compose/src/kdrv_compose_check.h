@@ -13,14 +13,6 @@ extern "C" {
 #endif
 
 /**
- * @brief How many pixels @p pixels become at a scale, as the accelerator counts them.
- * @param pixels     A width or a height.
- * @param sixteenths The scale; KDRV_COMPOSE_SCALE_ONE is the same size.
- * @return @p pixels * @p sixteenths / 16, rounded down.
- */
-uint32_t kdrv_compose_scaled(uint32_t pixels, uint16_t sixteenths);
-
-/**
  * @brief The size a block lands with after a scale and a turn.
  * @param from  The block.
  * @param sx    Scale along its width, in sixteenths.

@@ -49,6 +49,22 @@ typedef struct {
 } kdrv_compose_rect_t;
 
 /**
+ * @brief How many pixels @p pixels become at a scale, as the accelerator counts them.
+ *
+ * Arithmetic only, with no accelerator, so it is here in every build: a caller
+ * that places a scaled picture sizes it by the same rule the pass writes it
+ * with.
+ *
+ * @param pixels     A width or a height.
+ * @param sixteenths The scale; KDRV_COMPOSE_SCALE_ONE is the same size.
+ * @return @p pixels * @p sixteenths / 16, rounded down.
+ */
+static inline uint32_t kdrv_compose_scaled(uint32_t pixels, uint16_t sixteenths)
+{
+    return (pixels * (uint32_t)sixteenths) / KDRV_COMPOSE_SCALE_ONE;
+}
+
+/**
  * @brief Register with the accelerator, for scaling. Idempotent; takes no picture memory.
  *
  * A fill and a blend register their own clients at their first pass. Those

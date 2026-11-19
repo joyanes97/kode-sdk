@@ -192,3 +192,56 @@ bool kscreen_geom_frame_covers(const kscreen_geom_frame_t *f)
 {
     return KSCREEN_GEOM_FRAME_COPY == frame_fit(f);
 }
+
+/**
+ * @brief Add a strip of the glass to a present's, when it is not empty.
+ * @param out The present's place.
+ * @param x   First column.
+ * @param y   First row.
+ * @param w   Columns.
+ * @param h   Rows.
+ */
+static void strip_add(kscreen_geom_present_t *out, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if ( (0U != w) && (0U != h) && ((uint8_t)KSCREEN_GEOM_STRIPS > out->strips) )
+    {
+        out->strip[out->strips].x = (uint16_t)x;
+        out->strip[out->strips].y = (uint16_t)y;
+        out->strip[out->strips].w = (uint16_t)w;
+        out->strip[out->strips].h = (uint16_t)h;
+        out->strips++;
+    }
+}
+
+bool kscreen_geom_present(uint16_t pic_w, uint16_t pic_h, uint16_t sixteenths,
+                          kscreen_geom_present_t *out)
+{
+    uint32_t const glass_w = (uint32_t)KBSP_LCD_H_RES;
+    uint32_t const glass_h = (uint32_t)KBSP_LCD_V_RES;
+    bool           ok      = false;
+
+    if ( (KDRV_COMPOSE_SCALE_MIN <= sixteenths) && (KDRV_COMPOSE_SCALE_MAX >= sixteenths) )
+    {
+        uint32_t const w = kdrv_compose_scaled((uint32_t)pic_w, sixteenths);
+        uint32_t const h = kdrv_compose_scaled((uint32_t)pic_h, sixteenths);
+
+        if ( (0U != w) && (0U != h) && (glass_w >= w) && (glass_h >= h) )
+        {
+            /* Centred, the odd pixel left over going below and to the right. */
+            uint32_t const x = (glass_w - w) / 2U;
+            uint32_t const y = (glass_h - h) / 2U;
+
+            out->at.x   = (uint16_t)x;
+            out->at.y   = (uint16_t)y;
+            out->at.w   = (uint16_t)w;
+            out->at.h   = (uint16_t)h;
+            out->strips = 0U;
+            strip_add(out, 0U, 0U, glass_w, y);
+            strip_add(out, 0U, y + h, glass_w, glass_h - (y + h));
+            strip_add(out, 0U, y, x, h);
+            strip_add(out, x + w, y, glass_w - (x + w), h);
+            ok = true;
+        }
+    }
+    return ok;
+}

@@ -61,6 +61,15 @@ typedef struct {
                              *   kscreen's own.                           */
     lv_obj_t     *critical; /**< The critical battery notice while it is
                              *   up, else NULL. kscreen's own.            */
+    bool          presenting; /**< kscreen_present() has the glass and LVGL
+                             *   draws nothing. kscreen's own.            */
+    uint8_t       border_owed; /**< Framebuffers still to get the strips round
+                             *   a presented picture, 0 to 2. kscreen's own. */
+    uint32_t      border;   /**< The strips' colour, as lv_color_to_u32()
+                             *   gives it. kscreen's own.                 */
+    uint16_t      present_w; /**< The presented picture's scaled width, the
+                             *   last time. kscreen's own.                */
+    uint16_t      present_h; /**< Its scaled height. kscreen's own.       */
 } kscreen_t;
 
 /**
@@ -373,6 +382,61 @@ kode_status_t kscreen_pic_dim(kscreen_pic_t *dst, const kscreen_pic_t *src, lv_o
  * @return The object, or NULL when LVGL had no memory for it.
  */
 lv_obj_t *kscreen_frame_create(lv_obj_t *parent, const kscreen_pic_t *pic);
+
+/**
+ * @brief Show one frame a software renderer drew: @p pic scaled, centred on
+ *        the glass, the rest of the glass @p border.
+ *
+ * For an app that draws its whole frame itself, a game. One pass of the
+ * accelerator scales the picture straight into the panel's back framebuffer
+ * and the panel flips to it at its next refresh: no full-screen picture in
+ * between and no LVGL pass. The call returns once the flip is posted, and
+ * the picture may be drawn again at once; the next present waits for that
+ * flip before it writes.
+ *
+ * The first present takes the glass from LVGL: LVGL's refresh stops, while
+ * its timers and its input go on, and kscreen_tick() runs as before and draws
+ * nothing. kscreen_present_end() gives the glass back. So do the critical
+ * battery notice coming up (kscreen_critical()), a turn of the glass, and a
+ * pass refused or failed here, which answers with the pass's status as
+ * kscreen_pic_scale() does; the next present takes the glass again.
+ *
+ * The strips round the picture are painted only while they are owed: when
+ * the glass is taken, after a repaint, and when the scaled size or the
+ * colour changes, in each of the two framebuffers once.
+ *
+ * Call from the owner's thread only, outside kscreen_tick().
+ *
+ * @param s          The renderer, open.
+ * @param pic        The frame; any picture kscreen_pic_create() made.
+ * @param sixteenths The scale, KSCREEN_SCALE_MIN to KSCREEN_SCALE_MAX; the
+ *                   scaled size, rounded down as kscreen_pic_scale()'s, must
+ *                   fit the glass, 410 by 502.
+ * @param border     The colour of the glass round the picture.
+ * @return KODE_OK once the frame's flip is posted;
+ *         KODE_DENIED, with nothing changed, before kscreen_open() has
+ *         succeeded, with the glass asleep or turned, while the critical
+ *         battery notice is up, in a build without CONFIG_KODE_COMPOSE, for a
+ *         picture kscreen_pic_create() did not make, or for a scale out of
+ *         range or whose result is empty or does not fit;
+ *         KODE_NO_RESOURCES, with nothing changed, on a panel with a single
+ *         framebuffer or with the link down;
+ *         otherwise the pass's answer, as kscreen_pic_scale(), with the glass
+ *         given back to LVGL.
+ */
+kode_status_t kscreen_present(kscreen_t *s, const kscreen_pic_t *pic, uint16_t sixteenths,
+                              lv_color_t border);
+
+/**
+ * @brief Give the glass back to LVGL after kscreen_present().
+ *
+ * Waits for a flip still posted, points LVGL at the panel's framebuffers again
+ * and has it redraw the whole screen, then lets its refresh run. Does nothing
+ * when no present has the glass.
+ *
+ * @param s The renderer.
+ */
+void kscreen_present_end(kscreen_t *s);
 
 #if CONFIG_KODE_TEST_DOT
 /**
