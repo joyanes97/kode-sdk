@@ -328,3 +328,74 @@ TEST_CASE("a plain frame of its picture's size covers any area inside it, howeve
     f.clip.x1 = -1;
     TEST_ASSERT_FALSE_MESSAGE(kscreen_geom_frame_covers(&f), "an area reaching past its left edge");
 }
+
+/* kscreen_present(): a game's 272 x 332 frame shown at x1.5. The scaled size
+ * is the accelerator's own (rounded down), centred, and the glass it leaves is
+ * four strips, none empty. */
+TEST_CASE("a presented picture is centred, the glass round it four strips", "[kscreen_geom]")
+{
+    kscreen_geom_present_t p;
+    uint32_t               area = 0U;
+    uint8_t                i;
+
+    TEST_ASSERT_TRUE(kscreen_geom_present(272U, 332U, 24U, &p));
+    TEST_ASSERT_EQUAL_UINT16(1U, p.at.x);
+    TEST_ASSERT_EQUAL_UINT16(2U, p.at.y);
+    TEST_ASSERT_EQUAL_UINT16(408U, p.at.w);
+    TEST_ASSERT_EQUAL_UINT16(498U, p.at.h);
+    TEST_ASSERT_EQUAL_UINT8(4U, p.strips);
+
+    /* Above, below, left, right: together the glass less the picture. */
+    TEST_ASSERT_EQUAL_UINT16(0U, p.strip[0].y);
+    TEST_ASSERT_EQUAL_UINT16(GLASS_W, p.strip[0].w);
+    TEST_ASSERT_EQUAL_UINT16(2U, p.strip[0].h);
+    TEST_ASSERT_EQUAL_UINT16(500U, p.strip[1].y);
+    TEST_ASSERT_EQUAL_UINT16(2U, p.strip[1].h);
+    TEST_ASSERT_EQUAL_UINT16(0U, p.strip[2].x);
+    TEST_ASSERT_EQUAL_UINT16(1U, p.strip[2].w);
+    TEST_ASSERT_EQUAL_UINT16(498U, p.strip[2].h);
+    TEST_ASSERT_EQUAL_UINT16(409U, p.strip[3].x);
+    TEST_ASSERT_EQUAL_UINT16(1U, p.strip[3].w);
+    for ( i = 0U; i < p.strips; i++ )
+    {
+        area += (uint32_t)p.strip[i].w * (uint32_t)p.strip[i].h;
+    }
+    TEST_ASSERT_EQUAL_UINT32(((uint32_t)GLASS_W * GLASS_H) - (408U * 498U), area);
+}
+
+TEST_CASE("a presented picture that fills the glass leaves no strips, one a side short leaves one",
+          "[kscreen_geom]")
+{
+    kscreen_geom_present_t p;
+
+    TEST_ASSERT_TRUE(kscreen_geom_present(GLASS_W, GLASS_H, KDRV_COMPOSE_SCALE_ONE, &p));
+    TEST_ASSERT_EQUAL_UINT16(0U, p.at.x);
+    TEST_ASSERT_EQUAL_UINT16(0U, p.at.y);
+    TEST_ASSERT_EQUAL_UINT8(0U, p.strips);
+
+    /* A row short: the odd row goes below. */
+    TEST_ASSERT_TRUE(kscreen_geom_present(GLASS_W, (uint16_t)(GLASS_H - 1U), KDRV_COMPOSE_SCALE_ONE, &p));
+    TEST_ASSERT_EQUAL_UINT16(0U, p.at.y);
+    TEST_ASSERT_EQUAL_UINT8(1U, p.strips);
+    TEST_ASSERT_EQUAL_UINT16((uint16_t)(GLASS_H - 1U), p.strip[0].y);
+    TEST_ASSERT_EQUAL_UINT16(GLASS_W, p.strip[0].w);
+    TEST_ASSERT_EQUAL_UINT16(1U, p.strip[0].h);
+}
+
+TEST_CASE("a present whose scale is out of range, or whose result is empty or too big, is refused",
+          "[kscreen_geom]")
+{
+    kscreen_geom_present_t p;
+
+    TEST_ASSERT_FALSE_MESSAGE(kscreen_geom_present(272U, 332U, 0U, &p), "a scale of nothing");
+    TEST_ASSERT_FALSE_MESSAGE(kscreen_geom_present(1U, 1U, (uint16_t)(KDRV_COMPOSE_SCALE_MAX + 1U), &p),
+                              "past the largest scale");
+    TEST_ASSERT_FALSE_MESSAGE(kscreen_geom_present(272U, 332U, 25U, &p),
+                              "x1.5625 is 425 by 518, larger than the glass");
+    TEST_ASSERT_FALSE_MESSAGE(kscreen_geom_present(GLASS_W, 1U, 17U, &p), "a column too wide");
+    TEST_ASSERT_FALSE_MESSAGE(kscreen_geom_present(7U, 7U, 2U, &p),
+                              "7 at an eighth rounds down to nothing");
+    TEST_ASSERT_FALSE_MESSAGE(kscreen_geom_present(0U, 8U, KDRV_COMPOSE_SCALE_ONE, &p), "no columns");
+    TEST_ASSERT_TRUE_MESSAGE(kscreen_geom_present(8U, 8U, 2U, &p), "8 at an eighth is one pixel");
+    TEST_ASSERT_EQUAL_UINT16(1U, p.at.w);
+}

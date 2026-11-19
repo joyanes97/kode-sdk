@@ -131,19 +131,23 @@ static void flush_wait_cb(lv_display_t *disp)
 
     /* In direct mode only a frame's last area is posted; the others are
      * already in the framebuffer and there is nothing to wait for. */
-    if ( !s->posted )
+    kscreen_flush_settle(s);
+}
+
+void kscreen_flush_settle(kscreen_t *s)
+{
+    if ( s->posted )
     {
-        return;
-    }
-    s->posted = false;
-    if ( !kdrv_display_flush_wait(KSCREEN_FLUSH_TIMEOUT_MS) )
-    {
-        /* Returning says "done" anyway, and LVGL may reuse the draw buffer
-         * under a transfer that is somehow still live: a torn frame at worst.
-         * The alternative is not a cleaner frame, it is this thread never
-         * running again. */
-        KLOG_E(TAG, "the panel never reported a flush done in %u ms; "
-                    "dropping the frame", (unsigned)KSCREEN_FLUSH_TIMEOUT_MS);
+        s->posted = false;
+        if ( !kdrv_display_flush_wait(KSCREEN_FLUSH_TIMEOUT_MS) )
+        {
+            /* Returning says "done" anyway, and the buffer may be reused under
+             * a transfer that is somehow still live: a torn frame at worst.
+             * The alternative is not a cleaner frame, it is this thread never
+             * running again. */
+            KLOG_E(TAG, "the panel never reported a flush done in %u ms; "
+                        "dropping the frame", (unsigned)KSCREEN_FLUSH_TIMEOUT_MS);
+        }
     }
 }
 
@@ -221,22 +225,27 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
         /* unturned bands go as LVGL drew them */
     }
 
+    kscreen_flush_post(s, a, pixels, last);
+}
+
+void kscreen_flush_post(kscreen_t *s, const lv_area_t *rows, uint8_t *pixels, bool last)
+{
     FlushEvt * const ev = Q_NEW_X(FlushEvt, 0U, DISPLAY_FLUSH_SIG);
 
     s->posted = true;
     if ( NULL == ev )
     {
         /* No event to carry the chunk. The flush must still be completed, or
-         * LVGL would wait for one nobody was asked to do; kdrv_display decides
-         * every completion, so ask it to. */
+         * the renderer would wait for one nobody was asked to do; kdrv_display
+         * decides every completion, so ask it to. */
         kdrv_display_flush_abort();
     }
     else
     {
-        ev->x1     = a->x1;
-        ev->y1     = a->y1;
-        ev->x2     = a->x2 + 1;   /* esp_lcd's bounds are exclusive */
-        ev->y2     = a->y2 + 1;
+        ev->x1     = rows->x1;
+        ev->y1     = rows->y1;
+        ev->x2     = rows->x2 + 1;   /* esp_lcd's bounds are exclusive */
+        ev->y2     = rows->y2 + 1;
         ev->pixels = pixels;
         /* The last chunk is the one that makes the frame real: the panel's
          * driver assembles chunks in the framebuffer it is not scanning and
@@ -396,6 +405,11 @@ void kscreen_ctor(kscreen_t *s, QActive *owner, enum_t tick_sig)
     s->frame_copied = 0U;
     s->frame_drawn  = 0U;
     s->critical     = NULL;
+    s->presenting   = false;
+    s->border_owed  = 0U;
+    s->border       = 0U;
+    s->present_w    = 0U;
+    s->present_h    = 0U;
 }
 
 void kscreen_start(kscreen_t *s)
@@ -617,6 +631,9 @@ void kscreen_repaint(kscreen_t *s)
         }
         lv_obj_invalidate(lv_screen_active());
         lv_obj_invalidate(lv_layer_top());
+        /* A present paints its strips again: the link may have brought the
+         * framebuffers back new, and black. */
+        s->border_owed = KSCREEN_PRESENT_BUFFERS;
         if ( s->parked )
         {
             /* A tick that fell due before kscreen_park() may still be in the
@@ -644,6 +661,32 @@ void kscreen_park(kscreen_t *s, uint32_t seq)
              * starts the pass again. */
             KLOG_E(TAG, "could not tell the display the screen stopped drawing");
         }
+    }
+}
+
+void kscreen_present_end(kscreen_t *s)
+{
+    if ( (NULL != s->disp) && s->presenting )
+    {
+        lv_timer_t * const refr = lv_display_get_refr_timer(s->disp);
+
+        /* The flip a present posted last must be done before LVGL asks
+         * which framebuffer is free. */
+        kscreen_flush_settle(s);
+        s->presenting = false;
+        if ( s->direct && !s->parked )
+        {
+            /* The presents flipped the panel behind LVGL's back. Asleep, the
+             * framebuffers may be gone: the repaint aligns LVGL then. */
+            buffers_align(s->disp);
+        }
+        (void)lv_obj_invalidate(lv_screen_active());
+        (void)lv_obj_invalidate(lv_layer_top());
+        if ( NULL != refr )
+        {
+            lv_timer_resume(refr);
+        }
+        KLOG_I(TAG, "present: the glass is LVGL's again");
     }
 }
 
@@ -747,6 +790,8 @@ void kscreen_critical(kscreen_t *s, PowerCriticalEvt const *e)
         }
         else if ( NULL == s->critical )
         {
+            /* LVGL draws the notice: a present gives the glass back first. */
+            kscreen_present_end(s);
             critical_show(s);
             KLOG_N(TAG, "critical battery: notice up");
         }
@@ -784,6 +829,8 @@ kode_status_t kscreen_set_rotation(kscreen_t *s, lv_display_rotation_t rot)
     }
     else
     {
+        /* A turn is LVGL's to draw: a present gives the glass back first. */
+        kscreen_present_end(s);
         if ( LV_DISPLAY_ROTATION_0 == s->rot )
         {
             rc = partial_buffers_get(s);
@@ -914,7 +961,9 @@ void kscreen_test_dot_event(kscreen_t *s, QEvt const *e)
             }
         }
     }
-    /* Drawn and flushed now, so the answer means the glass shows it. */
+    /* Drawn and flushed now, so the answer means the glass shows it, and by
+     * LVGL: a present gives the glass back first. */
+    kscreen_present_end(s);
     lv_refr_now(s->disp);
     test_dot_screen_done(r->kind, r->seq);
 }

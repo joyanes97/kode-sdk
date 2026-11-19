@@ -71,11 +71,6 @@ static bool scale_valid(uint16_t sixteenths)
     return (KDRV_COMPOSE_SCALE_MIN <= sixteenths) && (KDRV_COMPOSE_SCALE_MAX >= sixteenths);
 }
 
-uint32_t kdrv_compose_scaled(uint32_t pixels, uint16_t sixteenths)
-{
-    return (pixels * (uint32_t)sixteenths) / KDRV_COMPOSE_SCALE_ONE;
-}
-
 void kdrv_compose_landed(const kdrv_compose_rect_t *from, uint16_t sx, uint16_t sy, uint8_t turns,
                          uint32_t *w, uint32_t *h)
 {

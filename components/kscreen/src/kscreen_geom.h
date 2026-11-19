@@ -14,6 +14,7 @@ extern "C" {
 #endif
 
 #define KSCREEN_GEOM_TURNS  4U  /**< Quarter turns in a whole one: a glass is turned 0 to 3. */
+#define KSCREEN_GEOM_STRIPS 4U  /**< The most strips round a presented picture: above, below, left, right. */
 
 /** @brief An area of a picture, both corners inside it, as LVGL counts them. */
 typedef struct {
@@ -155,6 +156,30 @@ kscreen_geom_frame_why_t kscreen_geom_frame_judge(const kscreen_geom_frame_t *f,
  * @return true for a plain object of its picture's size whose area lies inside it.
  */
 bool kscreen_geom_frame_covers(const kscreen_geom_frame_t *f);
+
+/** @brief Where a presented picture lands on the glass, and the glass round it. */
+typedef struct {
+    kscreen_geom_block_t at;                           /**< The scaled picture, centred. */
+    kscreen_geom_block_t strip[KSCREEN_GEOM_STRIPS];   /**< The glass it leaves, none empty. */
+    uint8_t              strips;                       /**< How many of @c strip there are, 0 to 4. */
+} kscreen_geom_present_t;
+
+/**
+ * @brief Place a picture scaled on the glass, centred, and find the strips round it.
+ *
+ * The scaled size is the accelerator's own (kdrv_compose_scaled()). The
+ * strips above and below are the glass's width; the ones left and right are
+ * the picture's height. A picture that fills the glass leaves none.
+ *
+ * @param pic_w      The picture's width.
+ * @param pic_h      Its height.
+ * @param sixteenths The scale, KDRV_COMPOSE_SCALE_MIN to KDRV_COMPOSE_SCALE_MAX.
+ * @param out        Receives the place and the strips; untouched on a refusal.
+ * @return true when the scale is in range and the scaled picture is not empty
+ *         and fits the upright glass.
+ */
+bool kscreen_geom_present(uint16_t pic_w, uint16_t pic_h, uint16_t sixteenths,
+                          kscreen_geom_present_t *out);
 
 #ifdef __cplusplus
 }

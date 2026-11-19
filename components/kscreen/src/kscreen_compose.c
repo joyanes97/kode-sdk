@@ -13,6 +13,7 @@
 #include "kaos.h"
 #include "kbsp_board.h"
 #include "kdrv_compose.h"
+#include "kdrv_display.h"
 #include "khal_system.h"
 #include "kode_log.h"
 /* Private in 9.6, and only these two: lvgl_private.h brings a driver's TAG()
@@ -342,6 +343,215 @@ kode_status_t kscreen_pic_grab(const kscreen_t *s, kscreen_pic_t *dst)
             rc = compose_pass(&job);
         }
     }
+    return rc;
+}
+
+/* ---- Presenting -------------------------------------------------------------
+ * An app that draws whole frames itself hands each one to kscreen_present():
+ * one pass scales it into the panel's back buffer and the panel flips to it,
+ * with no LVGL pass and no picture between. */
+
+#if defined(CONFIG_KODE_COMPOSE)
+
+/**
+ * @brief Whether the renderer may present now, and why not.
+ * @param s The renderer; may be NULL.
+ * @return KODE_OK, or the refusal kscreen_present() answers.
+ */
+static kode_status_t present_may(const kscreen_t *s)
+{
+    kode_status_t rc = KODE_DENIED;
+
+    if ( (NULL == s) || (NULL == s->disp) )
+    {
+        KLOG_W(TAG, "present: the renderer is not open");
+    }
+    else if ( s->parked )
+    {
+        KLOG_D(TAG, "present: the glass is asleep");
+    }
+    else if ( LV_DISPLAY_ROTATION_0 != s->rot )
+    {
+        KLOG_W(TAG, "present: the glass is turned");
+    }
+    else if ( NULL != s->critical )
+    {
+        KLOG_D(TAG, "present: the critical battery notice is up");
+    }
+    else if ( !s->direct )
+    {
+        KLOG_D(TAG, "present: the panel has one framebuffer");
+        rc = KODE_NO_RESOURCES;
+    }
+    else
+    {
+        rc = KODE_OK;
+    }
+    return rc;
+}
+
+/**
+ * @brief Take the glass from LVGL: its refresh timer waits until kscreen_present_end().
+ * @param s The renderer.
+ */
+static void present_take(kscreen_t *s)
+{
+    if ( !s->presenting )
+    {
+        lv_timer_t * const refr = lv_display_get_refr_timer(s->disp);
+
+        if ( NULL != refr )
+        {
+            lv_timer_pause(refr);
+        }
+        s->presenting  = true;
+        s->border_owed = (uint8_t)KSCREEN_PRESENT_BUFFERS;
+        KLOG_I(TAG, "present: the app draws the glass; LVGL waits");
+    }
+}
+
+/**
+ * @brief Paint the strips round a presented picture.
+ * @param dst    The back buffer.
+ * @param place  Where the picture lands and the strips it leaves.
+ * @param colour Their colour, 0xAARRGGBB.
+ * @return KODE_OK when every strip was painted, else the pass's answer.
+ */
+static kode_status_t present_border(display_pic_t const *dst, kscreen_geom_present_t const *place,
+                                    uint32_t colour)
+{
+    display_compose_t fill;
+    kode_status_t     rc = KODE_OK;
+    uint8_t           i  = 0U;
+
+    (void)memset(&fill, 0, sizeof(fill));
+    fill.op     = DISPLAY_COMPOSE_FILL;
+    fill.colour = colour;
+    fill.dst    = *dst;
+    while ( (KODE_OK == rc) && (i < place->strips) )
+    {
+        fill.x = place->strip[i].x;
+        fill.y = place->strip[i].y;
+        fill.w = place->strip[i].w;
+        fill.h = place->strip[i].h;
+        rc = compose_run(&fill);
+        i++;
+    }
+    return rc;
+}
+
+/**
+ * @brief Compose one frame in the back buffer and post its flip.
+ * @param s      The renderer, allowed to present.
+ * @param job    The scale, its source and factors filled in.
+ * @param place  Where the picture lands and the strips it leaves.
+ * @param back   The back buffer.
+ * @param colour The strips' colour, 0xAARRGGBB.
+ * @return KODE_OK once the flip is posted, else the pass's answer.
+ */
+static kode_status_t present_frame(kscreen_t *s, display_compose_t *job,
+                                   kscreen_geom_present_t const *place, uint8_t *back,
+                                   uint32_t colour)
+{
+    static const lv_area_t whole = { 0, 0, (int32_t)KBSP_LCD_H_RES - 1, (int32_t)KBSP_LCD_V_RES - 1 };
+    kode_status_t rc = KODE_OK;
+
+    present_take(s);
+    if ( (place->at.w != s->present_w) || (place->at.h != s->present_h) || (colour != s->border) )
+    {
+        s->present_w   = place->at.w;
+        s->present_h   = place->at.h;
+        s->border      = colour;
+        s->border_owed = (uint8_t)KSCREEN_PRESENT_BUFFERS;
+    }
+    /* The framebuffer's real size, whole cache lines: the PPA refuses an
+     * output that is not (kdrv_display_back_buffer()). */
+    job->dst.px    = back;
+    job->dst.bytes = (uint32_t)KDRV_DISPLAY_FB_BYTES;
+    job->dst.w     = (uint16_t)KBSP_LCD_H_RES;
+    job->dst.h     = (uint16_t)KBSP_LCD_V_RES;
+    job->dst_x     = place->at.x;
+    job->dst_y     = place->at.y;
+    if ( s->border_owed > 0U )
+    {
+        rc = present_border(&job->dst, place, colour);
+        if ( KODE_OK == rc )
+        {
+            s->border_owed--;
+        }
+    }
+    if ( KODE_OK == rc )
+    {
+        rc = compose_run(job);
+    }
+    if ( KODE_OK == rc )
+    {
+        kscreen_flush_post(s, &whole, back, true);
+    }
+    else
+    {
+        KLOG_W(TAG, "present: a pass was not done (status %d); the glass is LVGL's", (int)rc);
+        kscreen_present_end(s);
+    }
+    return rc;
+}
+
+#endif /* CONFIG_KODE_COMPOSE */
+
+/* cppcheck-suppress [misra-c2012-8.7,constParameterPointer] ; an app's call, none in this build; the renderer is changed */
+kode_status_t kscreen_present(kscreen_t *s, const kscreen_pic_t *pic, uint16_t sixteenths,
+                              lv_color_t border)
+{
+    kode_status_t rc = KODE_DENIED;
+
+#if defined(CONFIG_KODE_COMPOSE)
+    display_compose_t      job;
+    kscreen_geom_present_t place;
+
+    (void)memset(&job, 0, sizeof(job));
+    (void)memset(&place, 0, sizeof(place));
+    rc = present_may(s);
+    if ( KODE_OK == rc )
+    {
+        if ( !pic_view(pic, &job.src)
+            || !kscreen_geom_present(job.src.w, job.src.h, sixteenths, &place) )
+        {
+            KLOG_W(TAG, "present: not a picture, or a scale of %u that is out of range or "
+                        "leaves it empty or larger than the glass", (unsigned)sixteenths);
+            rc = KODE_DENIED;
+        }
+    }
+    if ( KODE_OK == rc )
+    {
+        uint8_t *back;
+
+        /* Until the flush posted last is done, the engine may still read the
+         * buffer this frame is about to be drawn in. */
+        kscreen_flush_settle(s);
+        /* cppcheck-suppress misra-c2012-11.5 ; kdrv_display hands the framebuffer back as void * */
+        back = (uint8_t *)kdrv_display_back_buffer();
+        if ( NULL == back )
+        {
+            KLOG_D(TAG, "present: the panel gives no back buffer");
+            rc = KODE_NO_RESOURCES;
+        }
+        else
+        {
+            job.op      = DISPLAY_COMPOSE_SCALE;
+            job.scale_x = sixteenths;
+            job.scale_y = sixteenths;
+            job.w       = job.src.w;
+            job.h       = job.src.h;
+            rc = present_frame(s, &job, &place, back, lv_color_to_u32(border));
+        }
+    }
+#else
+    (void)s;
+    (void)pic;
+    (void)sixteenths;
+    (void)border;
+    KLOG_W(TAG, "present: this build has no CONFIG_KODE_COMPOSE");
+#endif
     return rc;
 }
 
