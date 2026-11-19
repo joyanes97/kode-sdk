@@ -144,3 +144,55 @@ bool appmgr_backup_same(uint32_t file_len, const uint8_t *file_build,
     return (file_len == image_len)
         && (memcmp(file_build, image_build, KAPP_BUILD_LEN) == 0);
 }
+
+/**
+ * @brief Whether @p build is an id of zeros: what a file with no build id reads as.
+ * @param build KAPP_BUILD_LEN bytes.
+ * @return true when every byte is zero.
+ */
+static bool written_none(const uint8_t *build)
+{
+    bool none = true;
+
+    for ( uint32_t i = 0U; (i < KAPP_BUILD_LEN) && none; ++i )
+    {
+        none = (0U == build[i]);
+    }
+    return none;
+}
+
+bool appmgr_written_has(const appmgr_written_t *w, const uint8_t *build)
+{
+    bool held = false;
+
+    if ( !written_none(build) )
+    {
+        for ( uint32_t i = 0U; (i < w->count) && (!held); ++i )
+        {
+            held = (memcmp(w->build[i], build, KAPP_BUILD_LEN) == 0);
+        }
+    }
+    return held;
+}
+
+bool appmgr_written_add(appmgr_written_t *w, const uint8_t *build)
+{
+    bool changed = false;
+
+    if ( (!written_none(build)) && (!appmgr_written_has(w, build)) )
+    {
+        if ( APPMGR_WRITTEN_MAX <= w->count )
+        {
+            /* Full: the oldest goes, and the others move up one place. */
+            for ( uint32_t i = 1U; i < APPMGR_WRITTEN_MAX; ++i )
+            {
+                (void)memcpy(w->build[i - 1U], w->build[i], KAPP_BUILD_LEN);
+            }
+            w->count = APPMGR_WRITTEN_MAX - 1U;
+        }
+        (void)memcpy(w->build[w->count], build, KAPP_BUILD_LEN);
+        w->count += 1U;
+        changed = true;
+    }
+    return changed;
+}
