@@ -36,11 +36,11 @@ static char *s_fs_buf;
 _Static_assert(KODE_SYS_FILE_LIST_MAX == KODE_STORAGE_LIST_MAX,
                "kode_sys.h's listing ceiling and AO_Storage's have drifted apart");
 
-/** @brief Where a listing lands before any callback runs. */
-static StorageRow s_fs_rows[KODE_SYS_FILE_LIST_MAX];
+/** @brief Where a listing lands before any callback runs; PSRAM, taken by fs_enter() once. */
+static StorageRow *s_fs_rows;
 
-/** @brief Where AO_Storage writes its answers; @c done is set by kode_sys_files_init(), @c text by fs_enter(). */
-static StorageWaiter s_fs_wait = { .rows = s_fs_rows };
+/** @brief Where AO_Storage writes its answers; @c done is set by kode_sys_files_init(), @c text and @c rows by fs_enter(). */
+static StorageWaiter s_fs_wait;
 
 /** @brief How long a blocking file call waits for AO_Storage: a liveness bound, past the worst SD mount. */
 #define KODE_FS_WAIT_MS  5000U
@@ -79,7 +79,7 @@ static void fs_release(void)
  * predecessor did not time out pays nothing. When the stale answer never lands
  * this refuses with KODE_DENIED, nothing having been posted.
  * @return KODE_OK when the claim is held and fs_release() is owed; KODE_DENIED
- *         or KODE_NO_RESOURCES (no PSRAM for the buffer) when it is not.
+ *         or KODE_NO_RESOURCES (no PSRAM for the buffers) when it is not.
  */
 static kode_status_t fs_enter(void)
 {
@@ -95,17 +95,24 @@ static kode_status_t fs_enter(void)
     stale     = s_fs_stale;
     khal_mutex_unlock(s_fs_lock);
 
-    /* Kept for the boot: an abandoned request holds a pointer into it. */
+    /* Kept for the boot: an abandoned request holds a pointer into them. */
     if ( NULL == s_fs_buf )
     {
         /* cppcheck-suppress misra-c2012-11.5 ; khal_alloc_psram() answers void *: PSRAM is taken by name (rule 8) */
-        s_fs_buf = (char *)khal_alloc_psram(sizeof(uint32_t), (size_t)KODE_SYS_FILE_READ_MAX);
-        if ( NULL == s_fs_buf )
-        {
-            fs_release();
-            return KODE_NO_RESOURCES;
-        }
+        s_fs_buf       = (char *)khal_alloc_psram(sizeof(uint32_t), (size_t)KODE_SYS_FILE_READ_MAX);
         s_fs_wait.text = s_fs_buf;
+    }
+    if ( NULL == s_fs_rows )
+    {
+        /* cppcheck-suppress misra-c2012-11.5 ; khal_alloc_psram() answers void *: PSRAM is taken by name (rule 8) */
+        s_fs_rows      = (StorageRow *)khal_alloc_psram(sizeof(uint32_t),
+                                                       sizeof(StorageRow) * KODE_SYS_FILE_LIST_MAX);
+        s_fs_wait.rows = s_fs_rows;
+    }
+    if ( (NULL == s_fs_buf) || (NULL == s_fs_rows) )
+    {
+        fs_release();
+        return KODE_NO_RESOURCES;
     }
 
     if ( 0U == stale )

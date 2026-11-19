@@ -55,8 +55,8 @@ _Static_assert(KODE_FILE_READ_MAX == (4U * 1024U * 1024U),
 _Static_assert(KODE_FILE_LIST_MAX == KODE_SYS_FILE_LIST_MAX,
                "kode.h's listing and kode_sys.h's have drifted apart");
 
-_Static_assert(KODE_FILE_NAME_MAX == KODE_APP_FILE_MAX,
-               "kode.h's name and AO_Storage's file name have drifted apart");
+_Static_assert(KODE_FILE_NAME_MAX == KODE_STORAGE_NAME_MAX,
+               "kode.h's name and AO_Storage's listed name have drifted apart");
 
 /** @brief What a task keeps for its file calls, each block its own PSRAM. */
 struct kode_file_state {

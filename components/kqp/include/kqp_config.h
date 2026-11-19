@@ -795,6 +795,12 @@ _Static_assert(KODE_NET_CHECK_DWELL_MS < KODE_LOWPOWER_REQUEST_RETRY_WINDOW_MS,
  * would truncate, and a 268-byte event that fits no pool tier at all. */
 #define KODE_PATH_MAX  96U
 
+/** @brief Bytes of one name in a listing, NUL included: what a path holds, so
+ *         a listing leaves out no name a path could reach. The listing of the
+ *         bootable images keeps to KODE_APP_FILE_MAX, which is what every
+ *         reader of an image's name stores. */
+#define KODE_STORAGE_NAME_MAX  KODE_PATH_MAX
+
 /** @brief What one `write text=` may carry. `write path="<96>" text=""` spends 117 of
  * the line's 240 bytes, leaving 123, and this rounds that down. It is the tighter
  * of the two limits: StorageTextEvt carries a path AND a text, and at 120 it

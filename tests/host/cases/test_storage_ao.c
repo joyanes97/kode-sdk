@@ -1197,6 +1197,42 @@ TEST_CASE("a listing numbers its entries and ends with no more", "[storage_ao]")
     TEST_ASSERT_FALSE(end->more);
 }
 
+/* A listing of every file carries any name an entry holds. The listing of the
+ * bootable images keeps to KODE_APP_FILE_MAX, the name its readers store. */
+TEST_CASE("a 64-character name is in the listing of every file, not of the images",
+          "[storage_ao]")
+{
+    char name[KODE_APP_FILE_MAX + 1U];
+
+    storage_fresh();
+    (void)memset(name, 'x', KODE_APP_FILE_MAX);
+    (void)memcpy(&name[KODE_APP_FILE_MAX - 4U], ".bin", 5U);   /* KODE_APP_FILE_MAX chars */
+    make_file(name, 1U);
+    ao_spy_subscribe(STORAGE_ENTRY_SIG);
+    ao_spy_subscribe(STORAGE_LIST_END_SIG);
+
+    /* The host's directory may list "." and ".." beside it, in any order. */
+    storage_list_one(KDRV_MEDIUM_FS, false, true);
+    (void)qf_support_pump(AO_Storage, 8U);
+    bool         listed = false;
+    QEvt const  *e      = ao_spy_take();
+    while ( (NULL != e) && (STORAGE_ENTRY_SIG == e->sig) )
+    {
+        listed = listed || (strcmp(((StorageEntryEvt const *)e)->name, name) == 0);
+        e = ao_spy_take();
+    }
+    TEST_ASSERT_TRUE_MESSAGE(listed, "the listing of every file left the long name out");
+    TEST_ASSERT_NOT_NULL(e);
+    TEST_ASSERT_EQUAL_INT(STORAGE_LIST_END_SIG, (int)e->sig);
+
+    storage_list_one(KDRV_MEDIUM_FS, true, true);
+    (void)qf_support_pump(AO_Storage, 8U);
+    QEvt const * const images_end = ao_spy_take();
+    TEST_ASSERT_NOT_NULL(images_end);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(STORAGE_LIST_END_SIG, (int)images_end->sig,
+                                  "the images' listing carried the long name");
+}
+
 /* ---- The bootable images, in pages -------------------------------------- */
 
 /** @brief The most pages any case below may take before it calls it a loop. */
@@ -1221,7 +1257,7 @@ typedef struct {
     unsigned pages;              /**< Pages asked.                        */
     unsigned size[PAGES_MAX];    /**< Entries in each page.               */
     unsigned from_sd[PAGES_MAX]; /**< Of those, how many from the card.   */
-    char     name[64][KODE_APP_FILE_MAX]; /**< Every entry, by position.  */
+    char     name[64][KODE_STORAGE_NAME_MAX]; /**< Every entry, by position. */
 } pages_t;
 
 /**
@@ -1256,7 +1292,7 @@ static void read_pages(pages_t *p)
             StorageEntryEvt const * const en = (StorageEntryEvt const *)e;
             TEST_ASSERT_EQUAL_UINT16((uint16_t)p->total, en->pos);
             TEST_ASSERT_TRUE(64U > p->total);
-            (void)snprintf(p->name[p->total], KODE_APP_FILE_MAX, "%s", en->name);
+            (void)snprintf(p->name[p->total], sizeof(p->name[0]), "%s", en->name);
             ++p->total;
             ++p->size[p->pages];
             if ( en->from_sd )

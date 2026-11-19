@@ -371,6 +371,34 @@ TEST_CASE("appdata_ls lists a folder with no binary as an orphan",
     TEST_ASSERT_TRUE(replied(">ok"));
 }
 
+/** @brief A folder name of 64 characters: longer than a project's row holds. */
+#define AD_NAME_LONG  64U
+
+/* A folder whose name no row holds is no project's and no appdata verb could
+ * name it: it is left out and the log says so. A row cut to fit would name a
+ * folder that is not there. */
+TEST_CASE("appdata_ls leaves out a folder whose name is too long for a project",
+          "[console_appdata]")
+{
+    char name[AD_NAME_LONG + 1U];
+
+    console_up_once();
+    (void)memset(name, 'z', AD_NAME_LONG);
+    name[AD_NAME_LONG] = '\0';
+    put_fs_folder(name, JSON_OK);
+    put_fs_folder("scope", JSON_OK);
+
+    type_line("appdata_ls");
+    no_apps_installed();
+    settle_walk();
+
+    TEST_ASSERT_TRUE(replied(">|project=\"scope\" medium=fs json=ok icon=none "
+                             "app=orphan"));
+    TEST_ASSERT_FALSE(replied(">|project=\"z"));
+    TEST_ASSERT_TRUE(replied("appdata: ignoring"));
+    TEST_ASSERT_TRUE(replied(">ok"));
+}
+
 /* Nothing at all still closes: a listing that answers with silence is a
  * console stuck until its watchdog, which is a worse answer arriving later. */
 TEST_CASE("appdata_ls with nothing to list still closes", "[console_appdata]")

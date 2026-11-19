@@ -2701,7 +2701,7 @@ typedef struct {
  */
 typedef struct {
     QEvt super;
-    char     name[KODE_APP_FILE_MAX];
+    char     name[KODE_STORAGE_NAME_MAX];
     uint32_t size;
     bool     from_sd;   /**< false = the internal FAT partition. */
     bool     is_dir;    /**< Only the path-based walk (`ls`) knows this; the
@@ -7123,7 +7123,7 @@ typedef struct {
  * knows. See StorageWaiter for why a second shape exists at all.
  */
 typedef struct {
-    char     name[KODE_APP_FILE_MAX];
+    char     name[KODE_STORAGE_NAME_MAX];
     bool     is_dir;
     uint32_t size;
 } StorageRow;
