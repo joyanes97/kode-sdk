@@ -25,6 +25,12 @@ extern "C" {
 /* cppcheck-suppress misra-c2012-2.5 ; used by khal_console_esp.c's reader, which cppcheck does not analyse: esp_vfs.h stops it with an #error on FD_SETSIZE */
 #define KHAL_CONSOLE_REST_MS        1000U  /**< The reader's one wait while the console rests (khal_console_rest()):
                                             *   the longest a P4 in light sleep goes without a wake for it. */
+/* cppcheck-suppress misra-c2012-2.5 ; used by khal_console_esp.c's writer, which cppcheck does not analyse: esp_vfs.h stops it with an #error on FD_SETSIZE */
+#define KHAL_CONSOLE_TX_WAIT_MS     500U   /**< Longest a write to the cable waits for the driver's lock, and then as
+                                            *   long again for room in its TX ring. Past it nobody is reading, and
+                                            *   later writes are dropped until one fits. */
+#define KHAL_CONSOLE_TX_HOLD_MS     (2U * KHAL_CONSOLE_TX_WAIT_MS)  /**< Longest one chunk written to the cable
+                                            *   holds its writer: the lock's wait, then the ring's. */
 
 _Static_assert(KHAL_CONSOLE_FRAME_WAIT_MS < KHAL_CONSOLE_FRAME_SPAN_MS,
                "a wait shorter than the count's span: a frame in it always moves the count");
@@ -116,6 +122,20 @@ int32_t khal_console_read_raw(void *buf, size_t want, uint32_t timeout_ms);
  * @param len How many.
  */
 void khal_console_write(const char *buf, size_t len);
+
+/**
+ * @brief Bytes of output the cable dropped because its host was not reading.
+ *
+ * A write waits a bounded time for the host to read; past it, output is
+ * dropped until the host reads again, so a host that stops reading never
+ * stalls the writer. The cable's input drops nothing: when it is full the
+ * cable takes no more from the host, and the host waits. Opening the cable
+ * port resets the board, so on the cable this counts from the session's start.
+ *
+ * @return Bytes dropped since boot. Only ever grows; always 0 on a console
+ *         with no cable port (a UART).
+ */
+uint32_t khal_console_tx_dropped(void);
 
 /**
  * @brief Let the dock console's pins go: TinyUSB off the pads and the pads

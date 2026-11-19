@@ -865,6 +865,9 @@ unsigned fake_console_pad_offs(void);
 /** @brief How many times khal_console_pad() put the pad on the bus since fake_console_reset(). */
 unsigned fake_console_pad_ons(void);
 
+/** @brief Set what khal_console_tx_dropped() answers; fake_console_reset() makes it 0. */
+void fake_console_set_tx_dropped(uint32_t bytes);
+
 /** @brief What khal_watch_rest() was told last. */
 bool fake_watch_resting(void);
 

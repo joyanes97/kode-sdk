@@ -14,6 +14,7 @@
 
 #if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
 #include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_select.h"
 #include "driver/usb_serial_jtag_vfs.h"
 #include "hal/usb_serial_jtag_ll.h"
 #include "soc/usb_serial_jtag_struct.h"
@@ -304,34 +305,104 @@ kode_status_t khal_console_dock_take(void)
 }
 #endif /* CONFIG_KHAL_CONSOLE_DOCK */
 
+/* ---- The cable's input (USB-Serial/JTAG) ---------------------------------- */
+#if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+
+#define CABLE_RX_HEADROOM 1024U   /**< Bytes the driver's RX ring keeps free: with less, the cable takes no more packets and the host waits. */
+
+_Static_assert(CABLE_RX_HEADROOM < CONSOLE_RX_BUF,
+               "the RX ring holds more than the room it keeps free");
+
+/**
+ * @brief The driver's notice from its interrupt, after each packet it put in
+ *        the RX ring.
+ *
+ * IDF's interrupt copies every packet the host sends into the RX ring, and a
+ * packet that does not fit is lost whole, with nothing counted. So once the
+ * ring has less than CABLE_RX_HEADROOM free, this masks the interrupt that
+ * takes packets: the next one stays in the peripheral's FIFO, and the
+ * peripheral refuses (NAKs) the host's next ones until cable_rx_resume()
+ * unmasks it. A host that writes faster than the console reads waits instead
+ * of losing lines.
+ *
+ * The room kept is many packets, not one, for two reasons. A read takes its
+ * bytes out of the ring's count before it gives their room back. And IDF's
+ * writer enables its TX interrupt with a read-modify-write of the same
+ * register, which can undo this mask now and then: the next packet still
+ * fits, and its notice masks again.
+ *
+ * The hook is the one IDF's VFS takes for select(). Nothing selects on the
+ * console's descriptor (stdin is never read), so it stays this one.
+ *
+ * @param what       Which notice; only a packet in (USJ_SELECT_READ_NOTIF) is acted on.
+ * @param task_woken Unused: no task is woken here.
+ */
+static void cable_rx_notify(usj_select_notif_t what, int *task_woken)
+{
+    (void)task_woken;
+    if ( (USJ_SELECT_READ_NOTIF == what)
+        && ((CONSOLE_RX_BUF - CABLE_RX_HEADROOM) < usb_serial_jtag_get_read_bytes_available()) )
+    {
+        usb_serial_jtag_ll_disable_intr_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
+    }
+}
+
+/**
+ * @brief Let the cable take packets again once the ring has room. On the
+ *        reader task, after every read.
+ *
+ * The register says whether cable_rx_notify() masked the interrupt, so no
+ * flag can disagree with it. A packet that waited in the FIFO raises the
+ * interrupt as soon as it is unmasked. IDF's TX interrupt can undo this
+ * unmask with its own read-modify-write; the reader's next read, or its next
+ * timeout, unmasks again.
+ */
+static void cable_rx_resume(void)
+{
+    uint32_t const enabled = usb_serial_jtag_ll_get_intr_ena_status();
+
+    if ( (0U == (enabled & (uint32_t)USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT))
+        && ((CONSOLE_RX_BUF - CABLE_RX_HEADROOM) >= usb_serial_jtag_get_read_bytes_available()) )
+    {
+        usb_serial_jtag_ll_ena_intr_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
+    }
+}
+#endif /* CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG */
+
 /* ---- The cable's output (USB-Serial/JTAG) --------------------------------- */
 #if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
 
 #define CABLE_TX_CHUNK   128U   /**< Bytes per driver call, line endings included. */
-#define CABLE_TX_WAIT_MS 500U   /**< Longest wait for the driver's lock and then for room in its TX ring, each: past it nobody is reading. */
 #define CABLE_BYTE_MAX   2U     /**< Most one byte becomes on the wire: a newline and its '\r'. */
+
+static uint32_t s_tx_dropped;   /**< Bytes cable_put() dropped; written under stdout's lock. */
 
 /**
  * @brief Hand one chunk to the cable's driver.
  *
  * The driver's ring takes a chunk whole or not at all: usb_serial_jtag_write_bytes()
  * returns 0 or @p len, never a part, so a result is judged as zero or not.
- * A full ring makes the writer wait for the host, up to CABLE_TX_WAIT_MS. After
+ * A full ring makes the writer wait for the host, up to KHAL_CONSOLE_TX_WAIT_MS. After
  * a timeout every later chunk is tried without waiting, and dropped, until one
  * fits: nobody is reading, and a writer that waited each time would stall AO_Log.
+ * A dropped chunk is counted in khal_console_tx_dropped().
  * @param buf The bytes.
  * @param len How many, at most CABLE_TX_CHUNK.
  */
 static void cable_put(const char *buf, size_t len)
 {
     static bool stalled;   /* The host stopped draining TX. */
-    TickType_t  wait = pdMS_TO_TICKS(CABLE_TX_WAIT_MS);
+    TickType_t  wait = pdMS_TO_TICKS(KHAL_CONSOLE_TX_WAIT_MS);
 
     if ( stalled )
     {
         wait = 0U;
     }
     stalled = (0 == usb_serial_jtag_write_bytes(buf, len, wait));
+    if ( stalled )
+    {
+        s_tx_dropped += (uint32_t)len;
+    }
 }
 
 /**
@@ -401,6 +472,8 @@ void khal_console_init(void)
         .tx_buffer_size = CONSOLE_TX_BUF,
     };
     (void)usb_serial_jtag_driver_install(&cfg);
+    /* A full RX ring holds the host back instead of losing its packets. */
+    usb_serial_jtag_set_select_notif_callback(&cable_rx_notify);
     /* Without the driver, stdin is the ROM's non-blocking path. */
     usb_serial_jtag_vfs_use_driver();
     /* Binary input arrives verbatim: the VFS default turns CR into LF. */
@@ -429,7 +502,11 @@ void khal_console_init(void)
 static int32_t cable_read_ticks(void *buf, size_t want, TickType_t ticks)
 {
 #if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
-    return (int32_t)usb_serial_jtag_read_bytes(buf, (uint32_t)want, ticks);
+    int32_t const n = (int32_t)usb_serial_jtag_read_bytes(buf, (uint32_t)want, ticks);
+
+    /* After a timeout too: an unmask IDF's TX interrupt undid is redone here. */
+    cable_rx_resume();
+    return n;
 #elif defined(CONFIG_ESP_CONSOLE_UART)
     return (int32_t)uart_read_bytes((uart_port_t)CONFIG_ESP_CONSOLE_UART_NUM, buf,
                                     (uint32_t)want, ticks);
@@ -576,6 +653,15 @@ void khal_console_write(const char *buf, size_t len)
 #endif
 #if defined(CONFIG_KHAL_CONSOLE_DOCK)
     dock_write(buf, len);
+#endif
+}
+
+uint32_t khal_console_tx_dropped(void)
+{
+#if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+    return s_tx_dropped;
+#else
+    return 0U;
 #endif
 }
 

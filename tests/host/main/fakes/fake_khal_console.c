@@ -40,6 +40,9 @@ static bool     s_pad_on = true;
 static unsigned s_pad_offs;
 static unsigned s_pad_ons;
 
+/* What khal_console_tx_dropped() answers. */
+static uint32_t s_tx_dropped;
+
 /* The dock's pins: lent or held, how many calls, and what the next take answers. */
 static bool          s_dock_lent;
 static unsigned      s_dock_releases;
@@ -66,6 +69,7 @@ void fake_console_reset(void)
     s_pad_on        = true;
     s_pad_offs      = 0U;
     s_pad_ons       = 0U;
+    s_tx_dropped    = 0U;
 }
 
 void fake_console_clear_out(void)
@@ -176,6 +180,16 @@ kode_status_t khal_console_pad(bool on)
 void fake_console_set_frame(uint32_t frame)
 {
     s_frame = frame;
+}
+
+uint32_t khal_console_tx_dropped(void)
+{
+    return s_tx_dropped;
+}
+
+void fake_console_set_tx_dropped(uint32_t bytes)
+{
+    s_tx_dropped = bytes;
 }
 
 bool fake_console_pad_on(void)

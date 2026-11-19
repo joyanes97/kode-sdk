@@ -50,6 +50,7 @@
 #include "kode_log.h"
 #include "kbsp_identity.h"
 #include "kbsp_exp.h"       /* KBSP_EXP_COUNT, for the `ps` buffer */
+#include "khal_console.h"   /* khal_console_tx_dropped(), for `ps` */
 #include "khal_exp.h"       /* the expansion header's table, for `exp` and `ps` */
 #include "khal_i2c.h"       /* khal_i2c_probe(): `i2c_scan`, and nothing else */
 #include "khal_identity.h"
@@ -4531,16 +4532,20 @@ static bool ps_slice(Console *me)
         {
             /* `heap` is mostly PSRAM, so the internal pool DMA and the ISRs
              * share rides along: int_free and int_max now, int_low the lowest
-             * since boot, alloc_fail the requests the heap refused. */
+             * since boot, alloc_fail the requests the heap refused. Then what
+             * the console lost: log lines AO_Log could not take, input bytes
+             * past the reader's retry, output bytes the cable dropped while
+             * its host was not reading. */
             console_reply(">|heap=%u int_free=%u int_max=%u int_low=%u "
-                  "alloc_fail=%lu log_dropped=%lu rx_dropped=%lu",
+                  "alloc_fail=%lu log_dropped=%lu rx_dropped=%lu tx_dropped=%lu",
                   (unsigned)khal_heap_free(),
                   (unsigned)khal_heap_internal_free(),
                   (unsigned)khal_heap_internal_largest(),
                   (unsigned)khal_heap_internal_low(),
                   (unsigned long)khal_heap_alloc_failures(),
                   (unsigned long)log_dropped(),
-                  (unsigned long)console_rx_dropped());
+                  (unsigned long)console_rx_dropped(),
+                  (unsigned long)khal_console_tx_dropped());
         }
     }
     me->help_idx = end;

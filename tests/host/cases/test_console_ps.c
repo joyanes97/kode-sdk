@@ -101,6 +101,39 @@ TEST_CASE("ps prints the internal pool's low mark and its refusals",
     fake_heap_set_alloc_failures(0U);
 }
 
+TEST_CASE("ps prints the bytes the cable dropped on the way out, after rx_dropped",
+          "[console_ps]")
+{
+    const char *record = NULL;
+
+    console_up();
+    fake_console_set_tx_dropped(4321U);
+
+    type_line("ps");
+    for ( unsigned i = 0U; PS_TICKS > i; ++i )
+    {
+        (void)qf_support_tick(AO_Console, 1U);
+    }
+
+    for ( unsigned i = 0U; fake_klog_count() > i; ++i )
+    {
+        const char * const l = fake_klog_line(i);
+        if ( (NULL != l) && (strstr(l, ">|heap=") != NULL) )
+        {
+            record = l;
+        }
+    }
+    TEST_ASSERT_NOT_NULL(record);
+    const char * const rx = strstr(record, " rx_dropped=");
+    const char * const tx = strstr(record, " tx_dropped=4321");
+    TEST_ASSERT_NOT_NULL(rx);
+    TEST_ASSERT_NOT_NULL(tx);
+    TEST_ASSERT_TRUE(rx < tx);
+    TEST_ASSERT_TRUE(replied(">ok"));
+
+    fake_console_set_tx_dropped(0U);
+}
+
 /** @brief Stack of the worker the record case starts. */
 #define PS_WORKER_STACK  8192U
 

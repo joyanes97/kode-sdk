@@ -82,11 +82,14 @@ uint32_t console_rx_dropped(void)
     return s_rx_dropped;
 }
 
-/* The reader task's retry on an empty pool: 200 tries of 1 ms. Bounded so a
- * pool that stays empty gives the byte up rather than blocking the reader,
- * the wire's only consumer. */
+/* The reader task's retry on a full pool or queue: 1 ms a try, for as long as
+ * one chunk written to the cable can hold AO_Log (KHAL_CONSOLE_TX_HOLD_MS). A
+ * host that stops reading its output holds AO_Log that long, and the cable
+ * makes the host wait meanwhile, so its input slows down instead of losing a
+ * byte. Still bounded, so a pool that stays empty gives the byte up rather
+ * than blocking the reader for good. */
 #define KODE_CONSOLE_RX_RETRY_MS     1U
-#define KODE_CONSOLE_RX_RETRY_TRIES  200U
+#define KODE_CONSOLE_RX_RETRY_TRIES  (KHAL_CONSOLE_TX_HOLD_MS / KODE_CONSOLE_RX_RETRY_MS)
 
 /* The room a byte and a line leave in AO_Log's queue: the pools alone do not
  * bound it, and a post with no margin asserts. A line leaves more than a
@@ -239,9 +242,10 @@ static void log_sink(const char *line, size_t len, uint8_t src)
  *        blocking.
  *
  * Runs on the reader task, which may block. A burst wider than the small pool
- * can find it empty, so a failed allocation is retried for a bounded time
- * before the byte is given up and counted; hanging here would stop reading
- * the wire at all.
+ * can find it empty, and a write to the cable can hold AO_Log while its queue
+ * fills, so a failed allocation or post is retried for a bounded time before
+ * the byte is given up and counted; hanging here would stop the reader for
+ * good.
  */
 static void log_on_byte(uint8_t byte)
 {
