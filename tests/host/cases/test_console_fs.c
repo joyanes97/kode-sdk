@@ -522,7 +522,11 @@ TEST_CASE("ls with no path lists the working directory", "[console_fs]")
 /** @brief The words of a listed record around its name, with the terminator. */
 #define LS_RECORD_WORDS  48U
 /** @brief Room for one listed record, quoted name and all, whatever the name's length. */
-#define LS_RECORD_MAX    (KODE_APP_FILE_MAX + LS_RECORD_WORDS)
+#define LS_RECORD_MAX    (KODE_STORAGE_NAME_MAX + LS_RECORD_WORDS)
+/** @brief A name of 64 characters: the shortest the 64-byte entry left out. */
+#define LS_NAME_64       64U
+/** @brief The longest name an entry holds, its NUL aside. */
+#define LS_NAME_LONGEST  (KODE_STORAGE_NAME_MAX - 1U)
 
 /**
  * @brief The index of the first reply that ENDS with @p needle, as
@@ -588,6 +592,43 @@ TEST_CASE("ls lists a folder longer than a page whole, then says ok",
         TEST_ASSERT_TRUE_MESSAGE(0 <= at, name);
         TEST_ASSERT_TRUE_MESSAGE(at < ok, name);
     }
+}
+
+/* Every name an entry holds is listed. The entry once held 64 bytes and `ls`
+ * left a name of 64 characters or more out, still saying `>ok`. A name longer
+ * than an entry holds, which FAT allows, is left out and the log says so. */
+TEST_CASE("ls lists a name of 64 characters and one as long as an entry holds",
+          "[console_fs]")
+{
+    char name_64[LS_NAME_64 + 1U];
+    char longest[LS_NAME_LONGEST + 1U];
+    char too_long[KODE_STORAGE_NAME_MAX + 1U];
+    char want[LS_RECORD_MAX];
+    char why[sizeof("name longer than 999 chars")];
+
+    console_up_once();
+    (void)snprintf(why, sizeof(why), "name longer than %u chars", (unsigned)LS_NAME_LONGEST);
+    (void)memset(name_64, 'a', LS_NAME_64);
+    name_64[LS_NAME_64] = '\0';
+    (void)memset(longest, 'b', LS_NAME_LONGEST);
+    longest[LS_NAME_LONGEST] = '\0';
+    (void)memset(too_long, 'c', KODE_STORAGE_NAME_MAX);
+    too_long[KODE_STORAGE_NAME_MAX] = '\0';
+    fake_media_put_fs_file(name_64, "x");
+    fake_media_put_fs_dir(longest);
+    fake_media_put_fs_file(too_long, "x");
+
+    type_line("ls path=\"/storage\"");
+    settle();
+    settle();
+
+    (void)snprintf(want, sizeof(want), ">|name=\"%s\" type=file size=1 medium=fs", name_64);
+    TEST_ASSERT_TRUE_MESSAGE(replied_line(want), "the 64-character name");
+    (void)snprintf(want, sizeof(want), ">|name=\"%s\" type=dir size=0 medium=fs", longest);
+    TEST_ASSERT_TRUE_MESSAGE(replied_line(want), "the longest name an entry holds");
+    TEST_ASSERT_FALSE(replied(">|name=\"c"));
+    TEST_ASSERT_TRUE(replied(why));
+    TEST_ASSERT_TRUE(replied_line(">ok"));
 }
 
 /* A listing that cannot go on says so. The folder goes between the STAT and

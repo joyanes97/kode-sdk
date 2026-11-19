@@ -442,7 +442,7 @@ bool kode_led_toggle(void);
  */
 
 #define KODE_FILE_PATH_MAX 91U      /**< Bytes of a path, NUL included. */
-#define KODE_FILE_NAME_MAX 64U      /**< Bytes of one name in a listing, NUL included. */
+#define KODE_FILE_NAME_MAX 96U      /**< Bytes of one name in a listing, NUL included. */
 #define KODE_FILE_LIST_MAX 24U      /**< Entries one listing carries. */
 #define KODE_FILE_READ_MAX 4194304U /**< Largest file a read returns: 4 MiB. */
 #define KODE_FILE_BUSY_MS  5000U    /**< How long each storage request waits if storage is busy. */

@@ -1815,6 +1815,12 @@ TEST_CASE("a task that read a file frees its blocks when it ends", "[kode_file]"
 /** @brief Files in the folder of the plain listing. */
 #define TEST_FEW_FILES 3U
 
+/** @brief A name of 64 characters: the shortest one the 64-byte entry cut. */
+#define TEST_NAME_64 64U
+
+/** @brief Entries in the folder of long names. */
+#define TEST_LONG_NAMES 2U
+
 /** @brief Put a file of @p n 'x' bytes at @p rel under the internal volume. */
 static void put_fs_bytes(const char *rel, uint32_t n)
 {
@@ -2152,6 +2158,28 @@ TEST_CASE("a folder of three entries lists them with kind and size", "[kode_file
     TEST_ASSERT_NOT_NULL(e);
     TEST_ASSERT_TRUE(e->is_folder);
     TEST_ASSERT_EQUAL_UINT32(0U, e->size);
+    file_no_settle();
+}
+
+TEST_CASE("a name of 64 characters and one as long as an entry holds list whole", "[kode_file]")
+{
+    char                    name_64[TEST_NAME_64 + 1U];
+    char                    longest[KODE_FILE_NAME_MAX];
+    const kode_file_list_t *list;
+
+    file_fresh();
+    (void)memset(name_64, 'a', TEST_NAME_64);
+    name_64[TEST_NAME_64] = '\0';
+    (void)memset(longest, 'b', KODE_FILE_NAME_MAX - 1U);
+    longest[KODE_FILE_NAME_MAX - 1U] = '\0';
+    put_fs_bytes(name_64, 1U);
+    fake_media_put_fs_dir(longest);
+
+    list = kode_file_list("flash");
+    TEST_ASSERT_EQUAL_STRING("", kode_error());
+    TEST_ASSERT_EQUAL_UINT32(TEST_LONG_NAMES, list->count);
+    TEST_ASSERT_NOT_NULL_MESSAGE(entry_named(list, name_64), "the 64-character name");
+    TEST_ASSERT_NOT_NULL_MESSAGE(entry_named(list, longest), "the longest name an entry holds");
     file_no_settle();
 }
 

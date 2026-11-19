@@ -1601,6 +1601,24 @@ static bool is_app_image(const char *name)
     return (NULL != dot) && name_is(dot, ".bin");
 }
 
+/**
+ * @brief Bytes a listed name may take, NUL included.
+ * @param images_only The listing of the bootable images, whose readers keep a
+ *                    name in KODE_APP_FILE_MAX.
+ * @return KODE_APP_FILE_MAX for the images, KODE_STORAGE_NAME_MAX for any
+ *         other listing.
+ */
+static size_t list_name_max(bool images_only)
+{
+    size_t max = KODE_STORAGE_NAME_MAX;
+
+    if ( images_only )
+    {
+        max = KODE_APP_FILE_MAX;
+    }
+    return max;
+}
+
 /** Publish one entry. Runs inside kdrv_storage_list, on this AO's thread. */
 static bool publish_entry(const char *name, uint32_t size, void *ctx)
 {
@@ -1614,10 +1632,11 @@ static bool publish_entry(const char *name, uint32_t size, void *ctx)
     /* Skip rather than truncate: a name that does not fit the event would come
      * back as a request nobody could resolve to a file. */
     size_t const len = strlen(name);
-    if ( KODE_APP_FILE_MAX <= len )
+    size_t const max = list_name_max(c->images_only);
+    if ( max <= len )
     {
         KLOG_W(TAG, "ignoring '%s': name longer than %u chars",
-               name, (unsigned)(KODE_APP_FILE_MAX - 1U));
+               name, (unsigned)(max - 1U));
         return true;
     }
 
@@ -1756,7 +1775,7 @@ typedef struct {
  * @brief Post one entry of an ask's page, leaving KODE_STORAGE_LIST_FREE_SLOTS
  *        free in the asker's queue; an entry that does not fit ends the page.
  * @param c      The walk.
- * @param name   The entry's name, shorter than KODE_APP_FILE_MAX.
+ * @param name   The entry's name, shorter than KODE_STORAGE_NAME_MAX.
  * @param len    Its length.
  * @param is_dir A directory.
  * @param size   Its bytes.
@@ -1812,10 +1831,10 @@ static bool publish_path_entry(const char *name, bool is_dir, uint32_t size,
      * back as a request nobody could resolve to a file. Same rule
      * publish_entry() applies above. */
     size_t const len = strlen(name);
-    if ( KODE_APP_FILE_MAX <= len )
+    if ( KODE_STORAGE_NAME_MAX <= len )
     {
         KLOG_W(TAG, "ignoring '%s': name longer than %u chars",
-               name, (unsigned)(KODE_APP_FILE_MAX - 1U));
+               name, (unsigned)(KODE_STORAGE_NAME_MAX - 1U));
         return true;
     }
 

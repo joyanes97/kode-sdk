@@ -382,7 +382,10 @@ static bool appmgr_files_listing(QEvt const *e)
             {
                 appmgr_file_t * const f = &s_appmgr_page[s_appmgr_page_n];
 
-                (void)snprintf(f->name, sizeof(f->name), "%s", en->name);
+                /* The images' listing sends no name longer than KODE_APP_FILE_MAX
+                 * holds, so the bound cuts nothing: it tells the compiler so. */
+                (void)snprintf(f->name, sizeof(f->name), "%.*s",
+                               (int)sizeof(f->name) - 1, en->name);
                 f->size    = en->size;
                 f->from_sd = en->from_sd;
                 ++s_appmgr_page_n;

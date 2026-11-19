@@ -2571,10 +2571,24 @@ static void ad_entry(Console *me, const StorageEntryEvt *en)
              || ((uint8_t)KCLI_AD_FOLDERS_SD == me->ad_phase) )
     {
         /* A folder whose name is already a project is that project's folder;
-         * only the ones left over are orphans. */
-        if ( en->is_dir && !ad_has(me, en->name, (uint8_t)KCLI_AD_MAX) )
+         * only the ones left over are orphans. A name longer than a row holds
+         * is no project's, and no appdata verb could name it. */
+        if ( !en->is_dir )
+        {
+            /* A file among the folders: not app data. */
+        }
+        else if ( strlen(en->name) >= sizeof(me->ad_name[0]) )
+        {
+            KLOG_W(TAG, "appdata: ignoring '%s': name longer than %u chars",
+                   en->name, (unsigned)(sizeof(me->ad_name[0]) - 1U));
+        }
+        else if ( !ad_has(me, en->name, (uint8_t)KCLI_AD_MAX) )
         {
             ad_add(me, en->name, KCLI_AD_ORPHAN);
+        }
+        else
+        {
+            /* That project's own folder. */
         }
     }
     else
