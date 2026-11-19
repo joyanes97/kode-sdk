@@ -8617,6 +8617,122 @@ TEST_CASE("a replacement on a card that took no write warns before it is made",
     settle_card();                             /* the remount the failure owes */
 }
 
+/* ---- A change a file request asks for says the card's warning as kodeOS's own --
+ * The file requests (kode_sys_file_*(), storage_*_ask()) are made by kodeOS and
+ * the apps, not typed: the launcher saves its list in some twenty writes. Like a
+ * replacement, they are said only while the card has not proved it takes a
+ * write, and a console verb still says every change it makes there. A folder
+ * that is already there is answered as taken, and is no failure to warn about. */
+
+/** @brief What every warning before a change on the card says. */
+#define CARD_WARNING  "on the card:"
+
+/** @brief The bytes the cases below write. */
+static const char s_keep[] = "kept";
+
+TEST_CASE("changes asked on a card that took a write say no card warning",
+          "[storage_ao][ask][card]")
+{
+    StorageWaiter w;
+
+    sys_fresh();
+    TEST_ASSERT_TRUE(kdrv_sd_took_write());
+    fake_klog_reset();
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_file_create_folder(ao_spy(), "/sdcard/.kode"));
+    settle_card();
+    TEST_ASSERT_EQUAL_UINT((uint32_t)KODE_OK, sys_take(FILE_FOLDER_RSP_SIG)->rc);
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_file_write(ao_spy(), "/sdcard/.kode/list.keep",
+                                                       s_keep, 4U, false));
+    settle_card();
+    TEST_ASSERT_EQUAL_UINT((uint32_t)KODE_OK, sys_take(FILE_WRITE_RSP_SIG)->rc);
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_file_write(ao_spy(), "/sdcard/.kode/list.keep",
+                                                       s_keep, 4U, true));
+    settle_card();
+    TEST_ASSERT_EQUAL_UINT((uint32_t)KODE_OK, sys_take(FILE_WRITE_RSP_SIG)->rc);
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_file_rename(ao_spy(), "/sdcard/.kode/list.keep",
+                                                        "/sdcard/.kode/old.keep"));
+    settle_card();
+    TEST_ASSERT_EQUAL_UINT((uint32_t)KODE_OK, sys_take(FILE_RENAME_RSP_SIG)->rc);
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_file_delete(ao_spy(), "/sdcard/.kode/old.keep"));
+    settle_card();
+    TEST_ASSERT_EQUAL_UINT((uint32_t)KODE_OK, sys_take(FILE_DELETE_RSP_SIG)->rc);
+
+    /* An app's task asks through a wait instead of a queue. */
+    (void)memset(&w, 0, sizeof(w));
+    w.done = khal_sem_create();
+    w.rc   = 0xFFU;
+    storage_text_request_wait(&w, 1U, "/sdcard/.kode/task.keep", s_keep, 4U, false);
+    settle_card();
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(1U, w.ack, "AO_Storage never answered the task");
+    TEST_ASSERT_EQUAL_INT(KODE_OK, (int)w.rc);
+
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, log_count(CARD_WARNING),
+        "a change asked on a card that took a write was warned about");
+    ao_spy_drain();
+}
+
+TEST_CASE("a change asked on a card that took no write warns before it is made",
+          "[storage_ao][ask][card]")
+{
+    sys_fresh();
+    storage_bare_failed();
+    TEST_ASSERT_FALSE(kdrv_sd_took_write());
+    fake_klog_reset();
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_file_write(ao_spy(), "/sdcard/list.keep",
+                                                       s_keep, 4U, false));
+    settle_card();
+    TEST_ASSERT_EQUAL_UINT((uint32_t)KODE_OK, sys_take(FILE_WRITE_RSP_SIG)->rc);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1U, log_count("write on the card: /sdcard/list.keep"),
+        "a write on a card that took no write went without its warning");
+    ao_spy_drain();
+}
+
+TEST_CASE("a console change on a card that took a write still warns before it is made",
+          "[storage_ao][card]")
+{
+    sys_fresh();
+    TEST_ASSERT_TRUE(kdrv_sd_took_write());
+    fake_klog_reset();
+
+    storage_path_request(ao_spy(), (uint8_t)STORAGE_PATH_MKDIR, "/sdcard/typed");
+    settle_card();
+    storage_text_request(ao_spy(), "/sdcard/typed/note.txt", "hi", false, 0U);
+    settle_card();
+
+    TEST_ASSERT_EQUAL_UINT(1U, log_count("mkdir on the card: /sdcard/typed"));
+    TEST_ASSERT_EQUAL_UINT(1U, log_count("write on the card: /sdcard/typed/note.txt"));
+    ao_spy_drain();
+}
+
+TEST_CASE("a folder that is already there is answered as taken, with no failure said",
+          "[storage_ao][card]")
+{
+    const QEvt *e;
+
+    sys_fresh();
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_file_create_folder(ao_spy(), "/sdcard/.kode"));
+    settle_card();
+    TEST_ASSERT_EQUAL_UINT((uint32_t)KODE_OK, sys_take(FILE_FOLDER_RSP_SIG)->rc);
+    fake_klog_reset();
+
+    TEST_ASSERT_EQUAL_INT(KODE_OK, kode_sys_file_create_folder(ao_spy(), "/sdcard/.kode"));
+    settle_card();
+    TEST_ASSERT_EQUAL_UINT((uint32_t)KODE_EXISTS, sys_take(FILE_FOLDER_RSP_SIG)->rc);
+
+    storage_path_request(ao_spy(), (uint8_t)STORAGE_PATH_MKDIR, "/sdcard/.kode");
+    settle_card();
+    e = ao_spy_take();
+    TEST_ASSERT_NOT_NULL_MESSAGE(e, "the console's mkdir went unanswered");
+    TEST_ASSERT_EQUAL_INT(STORAGE_PATH_RSP_SIG, (int)e->sig);
+    TEST_ASSERT_EQUAL_INT(KODE_EXISTS, (int)((const StoragePathRspEvt *)e)->rc);
+
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0U, log_count("failed"),
+        "a folder that is there was said to have failed");
+    ao_spy_drain();
+}
+
 /* A remount owed while the copy held the handle waits for the download that
  * cut the copy to be taken: a remount begun first would refuse it. */
 TEST_CASE("a remount owed during a copy goes after the download that cuts it, which is taken",
