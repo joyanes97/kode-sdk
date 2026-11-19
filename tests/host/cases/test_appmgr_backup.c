@@ -120,6 +120,80 @@ TEST_CASE("a file is an app's copy only at its length and with its build id",
                               "another build was taken for the copy");
 }
 
+/* ---- The copies this board put on a card ----------------------------------- */
+
+static appmgr_written_t s_written;
+
+/** @brief A build id made of the byte @p b. */
+static const uint8_t *build_of(uint8_t b)
+{
+    static uint8_t id[KAPP_BUILD_LEN];
+
+    (void)memset(id, (int)b, sizeof(id));
+    return id;
+}
+
+TEST_CASE("a build noted is in the record, and another one is not",
+          "[appmgr_backup][written]")
+{
+    (void)memset(&s_written, 0, sizeof(s_written));
+
+    TEST_ASSERT_TRUE_MESSAGE(appmgr_written_add(&s_written, build_of(0x21U)),
+                             "a new id did not change the record");
+    TEST_ASSERT_TRUE(appmgr_written_has(&s_written, build_of(0x21U)));
+    TEST_ASSERT_FALSE_MESSAGE(appmgr_written_has(&s_written, build_of(0x22U)),
+                              "a build never noted was taken for a copy of the board's");
+}
+
+/* Every boot finds the copies it already has: noting one again stores nothing. */
+TEST_CASE("a build noted twice is kept once and changes nothing the second time",
+          "[appmgr_backup][written]")
+{
+    (void)memset(&s_written, 0, sizeof(s_written));
+    (void)appmgr_written_add(&s_written, build_of(0x21U));
+
+    TEST_ASSERT_FALSE_MESSAGE(appmgr_written_add(&s_written, build_of(0x21U)),
+                              "an id already held asked for the record to be stored");
+    TEST_ASSERT_EQUAL_UINT32(1U, s_written.count);
+}
+
+/* A file that is not an image, or an image with no descriptor, reads as an id
+ * of zeros: noting it would let the board write over any such file. */
+TEST_CASE("an id of zeros is never noted nor found",
+          "[appmgr_backup][written]")
+{
+    (void)memset(&s_written, 0, sizeof(s_written));
+
+    TEST_ASSERT_FALSE(appmgr_written_add(&s_written, build_of(0U)));
+    TEST_ASSERT_EQUAL_UINT32(0U, s_written.count);
+
+    s_written.count = 1U;     /* a zero id that came out of NVS as it was */
+    TEST_ASSERT_FALSE_MESSAGE(appmgr_written_has(&s_written, build_of(0U)),
+                              "a file with no build id was taken for a copy of the board's");
+}
+
+/* Full, the oldest goes: a file of that build is then left alone, never
+ * written over by mistake. */
+TEST_CASE("a full record lets its oldest id go for a new one",
+          "[appmgr_backup][written]")
+{
+    (void)memset(&s_written, 0, sizeof(s_written));
+    for ( uint32_t i = 0U; APPMGR_WRITTEN_MAX > i; ++i )
+    {
+        (void)appmgr_written_add(&s_written, build_of((uint8_t)(i + 1U)));
+    }
+
+    TEST_ASSERT_TRUE(appmgr_written_add(&s_written, build_of(0xF0U)));
+
+    TEST_ASSERT_EQUAL_UINT32(APPMGR_WRITTEN_MAX, s_written.count);
+    TEST_ASSERT_FALSE_MESSAGE(appmgr_written_has(&s_written, build_of(1U)),
+                              "the oldest id stayed in a full record");
+    TEST_ASSERT_TRUE(appmgr_written_has(&s_written, build_of(2U)));
+    TEST_ASSERT_TRUE(appmgr_written_has(&s_written, build_of(0xF0U)));
+    TEST_ASSERT_EQUAL_MEMORY_MESSAGE(build_of(2U), s_written.build[0], KAPP_BUILD_LEN,
+                                     "the ids did not move up: the next one out is not the oldest");
+}
+
 /* ---- The table against the directory --------------------------------------- */
 
 /** @brief A directory of @p n live apps with install numbers @p seqs. */

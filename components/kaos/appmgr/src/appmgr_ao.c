@@ -676,6 +676,8 @@ struct appmgr_bk {
     uint8_t     build[KAPP_BUILD_LEN];     /**< Its build id.                 */
     char        name[KDRV_SLOT_PROJECT_MAX]; /**< Its project name.           */
     char        path[KODE_APP_FILE_MAX];   /**< Its copy's path on the card.  */
+    uint32_t    card_len;                  /**< The length of the file found at that path. */
+    appmgr_written_t written;              /**< The copies this board put on a card: the only files it writes over. */
 };
 
 static AppMgr l_appMgr;
@@ -3950,6 +3952,7 @@ static QState AppMgr_initial(AppMgr * const me, void const * const par)
         KLOG_E(TAG, "no PSRAM for the chunk buffer; installs over the wire "
                     "and the mailbox are off");
     }
+    (void)khal_nvs_init();
     backup_init(me);
 
     /* The mailbox: if the host left an image at the fixed address, adopt it.
@@ -3958,7 +3961,6 @@ static QState AppMgr_initial(AppMgr * const me, void const * const par)
     uint32_t img_len = 0U;
     /* A table in NVS is an install a reset cut: its apps are looked at before
      * anything is served, the adoption included. */
-    (void)khal_nvs_init();
     appmgr_inst_init(&me->super);
     bool const recovering = undo_recover_begin(me);
     if ( kdrv_apps_pending_present(&img_len, NULL) )
@@ -5402,17 +5404,19 @@ static QState keep_on(AppMgr * const me)
 /* ---- Copies to the card ahead of an eviction ----------------------------------
  * Background work under AppMgr_idle: every request is still idle's, and
  * leaving the state gives up the copy in hand. One app at a time, oldest
- * first: a STAT of its name on the card, the build id of a file of its
- * length, and when the card has no copy the image is read out of the region
- * and written under a temporary name, then put on the app's name. Nothing is
- * shown while it runs.
+ * first: a STAT of its name on the card, the build id of a file found there,
+ * and when the card has no copy the image is read out of the region and
+ * written under a temporary name, then put on the app's name. A file at the
+ * name is written over only when it is a copy this board put there (the
+ * record in NVS, appmgr_written_t); anyone else's file, a newer build of the
+ * app among them, is left as it is. Nothing is shown while it runs.
  */
 
 /** @brief What the copy in hand waits for; the one-shot's meaning goes with it. */
 typedef enum {
     BK_WAIT = 0,   /**< No app in hand: the wait before the next one.          */
     BK_STAT,       /**< The card's answer about the app's name.                */
-    BK_DESC,       /**< The build id of the file of its length.                */
+    BK_DESC,       /**< The build id of the file at its name.                  */
     BK_READ,       /**< The next piece of the image out of the region.         */
     BK_WRITE,      /**< AO_Storage's write of the copy's temporary.            */
     BK_MOVE        /**< AO_Storage putting the finished copy on the app's name. */
@@ -5810,11 +5814,54 @@ static void backup_lp_busy(AppMgr * const me, const LowPowerStateEvt * const s)
 #endif /* CONFIG_KODE_LOWPOWER */
 
 /**
- * @brief Take the PSRAM the copies' state lives in and listen for the card's news.
+ * @brief Take the record of the copies this board put on a card out of NVS.
+ *
+ * No record, or one that is not a whole number of build ids, is an empty one:
+ * a file at an app's name is then written over only once the board has
+ * written or found that app's copy itself.
+ *
+ * @param me The AO, with the copies' state had and NVS ready.
+ */
+static void backup_written_load(AppMgr * const me)
+{
+    size_t len = sizeof(me->bk->written.build);
+
+    me->bk->written.count = 0U;
+    if ( (khal_nvs_get_blob(APPMGR_UNDO_NS, APPMGR_WRITTEN_KEY, me->bk->written.build, &len)
+          == KODE_OK)
+        && (0U == (len % KAPP_BUILD_LEN)) )
+    {
+        me->bk->written.count = (uint32_t)(len / KAPP_BUILD_LEN);
+    }
+}
+
+/**
+ * @brief Note the build of the app in hand as a copy of this board's, and store
+ *        the record when that changed it.
+ *
+ * A record NVS refuses costs the next boot that copy: it is taken for someone's
+ * file and left as it is.
+ *
+ * @param me The AO, with the app in hand's copy on the card, written or found.
+ */
+static void backup_written_note(AppMgr * const me)
+{
+    if ( appmgr_written_add(&me->bk->written, me->bk->build)
+        && (khal_nvs_set_blob(APPMGR_UNDO_NS, APPMGR_WRITTEN_KEY, me->bk->written.build,
+                              (size_t)me->bk->written.count * KAPP_BUILD_LEN) != KODE_OK) )
+    {
+        KLOG_W(TAG, "the copy of '%s' could not be noted; after a reboot the board "
+                    "leaves it as someone's file", me->bk->name);
+    }
+}
+
+/**
+ * @brief Take the PSRAM the copies' state lives in, read the record of the
+ *        copies this board wrote, and listen for the card's news.
  *
  * With no memory for it nothing is copied to the card ahead of an eviction.
  *
- * @param me The AO, in its initial transition.
+ * @param me The AO, in its initial transition, with NVS ready.
  */
 static void backup_init(AppMgr * const me)
 {
@@ -5828,6 +5875,7 @@ static void backup_init(AppMgr * const me)
     else
     {
         (void)memset(me->bk, 0, sizeof(*me->bk));   /* every app unseen, BK_WAIT */
+        backup_written_load(me);
         QActive_subscribe(&me->super, STORAGE_CARD_SIG);
     }
 }
@@ -6158,9 +6206,10 @@ static QState backup_on_stat(AppMgr * const me, const StoragePathRspEvt * const 
                me->bk->path, me->bk->name);
         backup_settle(me, APPMGR_BACKUP_SKIPPED, APPMGR_BACKUP_GAP_TICKS);
     }
-    else if ( card_has_copy(r, me->bk->len) )
+    else if ( card_has_file(r) )
     {
-        /* A file of the image's length: its build id says whose it is. */
+        /* A file at the app's name, of any length: its build id says whose it is. */
+        me->bk->card_len = r->size;
         storage_desc_request(me->bk->path, &me->super);
         me->bk->step = (uint8_t)BK_DESC;
         backup_arm(me, APPMGR_OPEN_TICKS);
@@ -6173,7 +6222,13 @@ static QState backup_on_stat(AppMgr * const me, const StoragePathRspEvt * const 
 }
 
 /**
- * @brief The build id of the file of the app's length.
+ * @brief The build id of the file at the app's name.
+ *
+ * The installed image's copy is found. An older copy this board put there is
+ * written over. Any other file is someone's - a newer build put on the card
+ * to be installed from, or not an app at all - and is left as it is: the app
+ * has no copy on this card, and an install evicts it without waiting.
+ *
  * @param me The AO.
  * @param d  The answer, for the path of the app in hand.
  */
@@ -6185,18 +6240,25 @@ static void backup_on_desc(AppMgr * const me, const StorageDescRspEvt * const d)
         backup_later(me, "the card is busy");
     }
     else if ( ((uint8_t)KODE_OK == d->status)
-             && appmgr_backup_same(me->bk->len, d->build, me->bk->len, me->bk->build) )
+             && appmgr_backup_same(me->bk->card_len, d->build, me->bk->len, me->bk->build) )
     {
         /* Found, not written: the card answered a STAT and a short read, and
          * the next app is looked at without the pause. */
         KLOG_D(TAG, "'%s' has its copy on the card", me->bk->name);
+        backup_written_note(me);
         backup_settle(me, APPMGR_BACKUP_COPIED, APPMGR_CHUNK_GAP_TICKS);
+    }
+    else if ( ((uint8_t)KODE_OK == d->status) && appmgr_written_has(&me->bk->written, d->build) )
+    {
+        KLOG_N(TAG, "'%s' is an older copy of '%s'; the app is copied over it",
+               me->bk->path, me->bk->name);
+        backup_copy(me);
     }
     else
     {
-        KLOG_N(TAG, "'%s' is another build of '%s'; the app is copied over it",
-               me->bk->path, me->bk->name);
-        backup_copy(me);
+        KLOG_N(TAG, "'%s' is not a copy this board wrote; it is left as it is, and "
+                    "'%s' has no copy on the card", me->bk->path, me->bk->name);
+        backup_settle(me, APPMGR_BACKUP_SKIPPED, APPMGR_CHUNK_GAP_TICKS);
     }
 }
 
@@ -6276,6 +6338,7 @@ static void backup_on_move(AppMgr * const me, const StoragePathRspEvt * const r)
     if ( (uint8_t)KODE_OK == r->rc )
     {
         KLOG_N(TAG, "'%s' copied to %s", me->bk->name, me->bk->path);
+        backup_written_note(me);
         backup_settle(me, APPMGR_BACKUP_COPIED, APPMGR_BACKUP_GAP_TICKS);
     }
     else if ( (uint8_t)KODE_DENIED == r->rc )

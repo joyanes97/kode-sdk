@@ -36,6 +36,7 @@
 #include "miniz.h"
 #include "qf_support.h"
 #include "radio_knocks.h"
+#include "appmgr_backup.h"
 #include "appmgr_outcome.h"
 #include "esp_private/partition_linux.h"
 
@@ -12258,8 +12259,6 @@ TEST_CASE("an app whose copy is on the card is not copied",
     backup_end();
 }
 
-/* A new version of an app can be as long as the one before: the card's file
- * is the copy only with the build id of the image installed. */
 /* A copy found costs the card a STAT and a short read: the pause is for a
  * copy that was written. */
 TEST_CASE("an app found copied lets the next one be asked about without the pause",
@@ -12278,19 +12277,101 @@ TEST_CASE("an app found copied lets the next one be asked about without the paus
     backup_end();
 }
 
-TEST_CASE("a file of the app's length made by another build is copied over",
-          "[appmgr_ao][backup]")
+/** @brief Plant in NVS the record of the copies this board put on a card: one, of the build @p build. */
+static void written_seed(uint8_t build)
 {
-    backup_fresh(1U);
+    uint8_t id[KAPP_BUILD_LEN];
+
+    (void)memset(id, (int)build, sizeof(id));
+    fake_nvs_seed(APPMGR_UNDO_NS, APPMGR_WRITTEN_KEY, id, sizeof(id));
+}
+
+/** @brief Whether the record of the copies in NVS holds the build @p build. */
+static bool written_holds(uint8_t build)
+{
+    static uint8_t ids[APPMGR_WRITTEN_MAX][KAPP_BUILD_LEN];
+    uint8_t        id[KAPP_BUILD_LEN];
+    size_t         len  = sizeof(ids);
+    bool           held = false;
+
+    (void)memset(id, (int)build, sizeof(id));
+    if ( khal_nvs_get_blob(APPMGR_UNDO_NS, APPMGR_WRITTEN_KEY, ids, &len) == KODE_OK )
+    {
+        for ( size_t i = 0U; (i < (len / KAPP_BUILD_LEN)) && (!held); ++i )
+        {
+            held = (0 == memcmp(ids[i], id, sizeof(id)));
+        }
+    }
+    return held;
+}
+
+/**
+ * @brief Answer "first"'s STAT with a file of @p bytes and its build id with
+ *        @p build: the file at the app's name, as AO_Storage reads it.
+ */
+static void backup_file_at_name(uint32_t bytes, uint8_t build)
+{
     backup_wait();
     path_req_expect((uint8_t)STORAGE_PATH_STAT, "/sdcard/first.bin",
                     "the app was not asked about");
-    answer_copy_of(KAPPS_ALIGN);
-    storage_expect(STORAGE_DESC_REQ_SIG, "the file was not asked its build id");
+    answer_copy_of(bytes);
+    const QEvt * const d = storage_take(STORAGE_DESC_REQ_SIG);
+    TEST_ASSERT_NOT_NULL_MESSAGE(d, "the file at the app's name was not asked its build id");
+    TEST_ASSERT_EQUAL_STRING("/sdcard/first.bin", ((StorageDescReqEvt const *)d)->name);
+    QF_gc(d);
+    answer_desc("/sdcard/first.bin", build);
+}
 
-    answer_desc("/sdcard/first.bin", (uint8_t)(BACKUP_BUILD + 1U));
+/* A new build of an app put on the card under the app's name, by hand or by
+ * `file_put`, is how an app is updated with no network: the board must not
+ * put the installed image over it (kodediy/kode-sdk#205). The same length
+ * is no exception: a new version can be as long as the one before. */
+TEST_CASE("a file at the app's name that this board did not write is left as it is",
+          "[appmgr_ao][backup]")
+{
+    static const uint32_t lens[] = { KAPPS_ALIGN, KAPPS_ALIGN + 4096U };
+
+    for ( size_t i = 0U; i < (sizeof(lens) / sizeof(lens[0])); ++i )
+    {
+        backup_fresh(1U);
+        fake_klog_reset();
+        backup_file_at_name(lens[i], (uint8_t)(BACKUP_BUILD + 1U));
+
+        TEST_ASSERT_TRUE_MESSAGE(klog_has("'/sdcard/first.bin' is not a copy this board wrote"),
+                                 "a file left alone was not said");
+        run_ticks(BACKUP_WAIT_STEPS + BACKUP_GAP_STEPS);
+        TEST_ASSERT_TRUE_MESSAGE(storage_quiet(),
+            "someone's file at the app's name was written over, or asked about again");
+        backup_end();
+    }
+}
+
+/* A file that is not an image reads with no build id: it is someone's too,
+ * even against a record that came out of NVS holding an id of zeros. */
+TEST_CASE("a file at the app's name with no build id is left as it is",
+          "[appmgr_ao][backup]")
+{
+    written_seed(0U);
+    backup_fresh(1U);
+    backup_file_at_name(KAPPS_ALIGN + 4096U, 0U);
+
+    run_ticks(BACKUP_WAIT_STEPS + BACKUP_GAP_STEPS);
+    TEST_ASSERT_TRUE_MESSAGE(storage_quiet(), "a file with no build id was written over");
+    backup_end();
+}
+
+/* An app updated from elsewhere (a URL, the terminal, the mailbox) leaves the
+ * board's copy of its earlier build at its name: that one is written over,
+ * whatever its length. */
+TEST_CASE("an older copy this board wrote is copied over",
+          "[appmgr_ao][backup]")
+{
+    written_seed(BACKUP_BUILD + 1U);
+    backup_fresh(1U);
+    backup_file_at_name(KAPPS_ALIGN + 4096U, (uint8_t)(BACKUP_BUILD + 1U));
+
     const QEvt * const wr = storage_wait_for(STORAGE_WRITE_REQ_SIG, 100U);
-    TEST_ASSERT_NOT_NULL_MESSAGE(wr, "another build's file was taken for the app's copy");
+    TEST_ASSERT_NOT_NULL_MESSAGE(wr, "the board's own older copy was not written over");
     TEST_ASSERT_EQUAL_STRING("/sdcard/first.bin.tmp", ((StorageWriteEvt const *)wr)->name);
     QF_gc(wr);
 
@@ -12302,6 +12383,61 @@ TEST_CASE("a file of the app's length made by another build is copied over",
 
     run_ticks(BACKUP_WAIT_STEPS + BACKUP_GAP_STEPS);
     TEST_ASSERT_TRUE_MESSAGE(storage_quiet(), "an app just copied was seen to again");
+    backup_end();
+}
+
+/* What the board wrote is what it may write over at the next boot. */
+TEST_CASE("a copy written is noted in NVS",
+          "[appmgr_ao][backup]")
+{
+    backup_fresh(1U);
+    backup_to_the_write();
+    answer_write((uint8_t)KODE_OK, KAPPS_ALIGN);
+    pair_req_expect("/sdcard/first.bin.tmp", "/sdcard/first.bin",
+                    "the finished copy was not put on the app's name");
+    TEST_ASSERT_FALSE_MESSAGE(written_holds(BACKUP_BUILD),
+                              "the copy was noted before it was on its name");
+    answer_replace((uint8_t)KODE_OK);
+
+    TEST_ASSERT_TRUE_MESSAGE(written_holds(BACKUP_BUILD), "the copy written was not noted");
+    backup_end();
+}
+
+/* A copy made before the record existed is the installed image: noted when it
+ * is found, so the next build of the app may write over it. Found again at
+ * every mount, it is stored once. */
+TEST_CASE("a copy found is noted in NVS, and stored only the first time",
+          "[appmgr_ao][backup]")
+{
+    backup_fresh(1U);
+    backup_file_at_name(KAPPS_ALIGN, BACKUP_BUILD);
+    TEST_ASSERT_TRUE_MESSAGE(written_holds(BACKUP_BUILD), "the copy found was not noted");
+    unsigned const sets = fake_nvs_set_count();
+
+    card_event(true);
+    backup_file_at_name(KAPPS_ALIGN, BACKUP_BUILD);
+
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(sets, fake_nvs_set_count(),
+                                   "a copy already noted was stored again");
+    backup_end();
+}
+
+/* NVS that refuses the record costs the next boot what it knew: the copy
+ * stands, and the log says it will be taken for someone's file. */
+TEST_CASE("a board whose NVS cannot keep the record says so and goes on",
+          "[appmgr_ao][backup]")
+{
+    backup_fresh(1U);
+    backup_to_the_write();
+    answer_write((uint8_t)KODE_OK, KAPPS_ALIGN);
+    pair_req_expect("/sdcard/first.bin.tmp", "/sdcard/first.bin",
+                    "the finished copy was not put on the app's name");
+    fake_nvs_fail_next_set();
+    answer_replace((uint8_t)KODE_OK);
+
+    TEST_ASSERT_TRUE(klog_has("'first' copied to /sdcard/first.bin"));
+    TEST_ASSERT_TRUE_MESSAGE(klog_has("the copy of 'first' could not be noted"),
+                             "a record NVS refused was not said");
     backup_end();
 }
 
@@ -12940,8 +13076,9 @@ TEST_CASE("the slot an install takes is the one its plan named",
 }
 
 /* "Make room" says an app is kept from what the table knows of its build: a
- * file of its length that the table found to be another build is not it. */
-TEST_CASE("an app whose copy could not be made over another build is not kept, whatever its length",
+ * file of its length that the table found to be someone else's build is not
+ * it, and the board leaves that file as it is. */
+TEST_CASE("an app whose name holds someone else's build is not kept, whatever its length",
           "[appmgr_ao][backup][evict]")
 {
     evict_answer_t a;
@@ -12952,10 +13089,8 @@ TEST_CASE("an app whose copy could not be made over another build is not kept, w
     answer_copy_of(old_bytes());
     storage_expect(STORAGE_DESC_REQ_SIG, "the file was not asked its build id");
     answer_desc("/sdcard/old.bin", 0x77U);     /* another build of the same length */
-    const QEvt * const wr = storage_wait_for(STORAGE_WRITE_REQ_SIG, 1000U);
-    TEST_ASSERT_NOT_NULL_MESSAGE(wr, "another build was not copied over");
-    QF_gc(wr);
-    answer_write((uint8_t)KODE_ERROR, 0U);     /* the card takes no write */
+    TEST_ASSERT_NULL_MESSAGE(storage_wait_for(STORAGE_WRITE_REQ_SIG, 1000U),
+                             "someone else's build was written over");
     (void)storage_tally();
 
     (void)memset(&a, 0, sizeof(a));

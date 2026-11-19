@@ -91,4 +91,42 @@ const kapps_entry_t *appmgr_backup_next(const appmgr_backup_t *t, const kapps_di
 bool appmgr_backup_same(uint32_t file_len, const uint8_t *file_build,
                         uint32_t image_len, const uint8_t *image_build);
 
+#define APPMGR_WRITTEN_MAX  32U        /**< Build ids the record keeps; the oldest goes first. */
+#define APPMGR_WRITTEN_KEY  "written"  /**< The record's key, in APPMGR_UNDO_NS.               */
+
+/**
+ * @brief The build ids of the copies this board put on a card, oldest first.
+ *
+ * A file at an app's name on the card is written over only when it is one of
+ * them: an older copy of the board's own. Any other file there was put by
+ * someone, and is left as it is. Kept in NVS, unlike the table: it names
+ * images, not a card, so it stays true whichever card is in.
+ */
+typedef struct {
+    uint8_t  build[APPMGR_WRITTEN_MAX][KAPP_BUILD_LEN]; /**< The ids, oldest first. */
+    uint32_t count;                                      /**< Ids held.             */
+} appmgr_written_t;
+
+/**
+ * @brief Whether this board put a copy with the build id @p build on a card.
+ * @param w     The record.
+ * @param build KAPP_BUILD_LEN bytes. An id of zeros, a file that has none, is
+ *              never one.
+ * @return true when the record holds @p build.
+ */
+bool appmgr_written_has(const appmgr_written_t *w, const uint8_t *build);
+
+/**
+ * @brief Note a copy with the build id @p build: written by this board, or found
+ *        on the card as the installed image.
+ *
+ * An id is kept once. With the record full the oldest id goes, and a file of
+ * that build is then left alone like anyone's. An id of zeros is not kept.
+ *
+ * @param w     The record.
+ * @param build KAPP_BUILD_LEN bytes.
+ * @return true when the record changed and is to be stored again.
+ */
+bool appmgr_written_add(appmgr_written_t *w, const uint8_t *build);
+
 #endif /* APPMGR_BACKUP_H_ */
