@@ -183,6 +183,8 @@ if(CONFIG_KODEOS_RADIO)
         list(APPEND srcs "radio/src/kdrv_ble_tokens.c")
         # The count of bonded peers, kept for readers that take no lock, pure C.
         list(APPEND srcs "radio/src/kdrv_ble_bonds.c")
+        # Which address the board advertises, and a random static one's shape, pure C.
+        list(APPEND srcs "radio/src/kdrv_ble_own.c")
         # The scan response's packing, pure C.
         list(APPEND srcs "radio/src/kdrv_ble_adv.c")
         # The advertisements heard: a record and the ring that hands them on.

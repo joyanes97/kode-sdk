@@ -12984,6 +12984,10 @@ static QState Radio_up_outcome(Radio * const me, RadioOutcome const * const job)
                 }
             }
             ble_publish_state(me);
+            /* The driver took the advert off to put a new address on the air;
+             * it comes back from that address, showing the board to everyone
+             * now that it knows nobody. */
+            (void)radio_ble_adv_reconcile(me);
             status = Q_HANDLED();
             break;
         }
