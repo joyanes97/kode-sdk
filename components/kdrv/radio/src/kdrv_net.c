@@ -537,37 +537,28 @@ static uint32_t stream_time_left(uint32_t t0, uint32_t cap_ms)
 }
 
 /**
- * @brief Say that a server's certificate was refused for its dates, when it was.
+ * @brief Say that a server's certificate was refused, and what the clock read.
  *
- * mbedTLS judges the dates against the wall clock, so a wrong clock refuses a
- * good certificate as surely as a bad certificate is refused. The line names
- * the clock too; "could not open" alone reads as a dead server.
+ * mbedTLS judges a certificate's dates against the wall clock, so a wrong clock
+ * refuses a good certificate as surely as a bad certificate is refused. The
+ * line names the clock; "could not open" alone reads as a dead server.
  *
- * @param flags What the TLS layer reported of the verification
- *              (MBEDTLS_X509_BADCERT_*); with neither date flag nothing is said.
- * @param url   The address asked; the line names its host alone.
+ * The line cannot say why. esp-tls keeps the verify flags only while mbedTLS
+ * still holds the peer's certificate, and after a refused first handshake it
+ * holds none: the flags always read 0 there. The error code is kept.
+ *
+ * @param stack_err The TLS stack's last error, as esp-tls keeps it (mbedTLS's
+ *                  code negated); anything but a refused certificate says
+ *                  nothing.
+ * @param url       The address asked; the line names its host alone.
  */
-static void net_cert_dates_say(int flags, const char *url)
+static void net_cert_refused_say(int stack_err, const char *url)
 {
-    uint32_t const f   = (uint32_t)flags;
-    const char    *why = NULL;
-
-    if ( 0U != (f & (uint32_t)MBEDTLS_X509_BADCERT_EXPIRED) )
-    {
-        why = "has expired";
-    }
-    else if ( 0U != (f & (uint32_t)MBEDTLS_X509_BADCERT_FUTURE) )
-    {
-        why = "is not valid yet";
-    }
-    else
-    {
-        /* Refused for something else, or not refused: nothing to add. */
-    }
-    if ( NULL != why )
+    if ( (-MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) == stack_err )
     {
         char        host[KDRV_NET_HOST_MAX];
         char        clock[NET_CLOCK_TEXT_MAX];
+        const char *reads  = "reads ";
         const char *source = "";
 
         if ( kdrv_net_url_host(url, host, sizeof(host)) != KODE_OK )
@@ -576,7 +567,8 @@ static void net_cert_dates_say(int flags, const char *url)
         }
         if ( kdrv_clocks_wall_iso(clock, sizeof(clock)) != KODE_OK )
         {
-            (void)snprintf(clock, sizeof(clock), "%s", "not set");
+            reads = "is not set";
+            clock[0] = '\0';
         }
         else if ( kdrv_clocks_wall_approx() )
         {
@@ -586,14 +578,14 @@ static void net_cert_dates_say(int flags, const char *url)
         {
             /* Set by the network or by a person. */
         }
-        KLOG_W(TAG, "%s: its certificate %s by the clock (%s%s)", host, why,
-               clock, source);
+        KLOG_W(TAG, "%s: its certificate was refused; the clock %s%s%s", host,
+               reads, clock, source);
     }
 }
 
 /**
- * @brief After a request that could not be sent: say whether the certificate's
- *        dates were the reason (net_cert_dates_say()).
+ * @brief After a request that could not be sent: say whether the server's
+ *        certificate was refused (net_cert_refused_say()).
  *
  * @param h   The client the request failed on, before its cleanup.
  * @param url The address asked.
@@ -603,10 +595,11 @@ static void net_http_cert_say(esp_http_client_handle_t h, const char *url)
     int tls_code  = 0;
     int tls_flags = 0;
 
-    if ( esp_http_client_get_and_clear_last_tls_error(h, &tls_code, &tls_flags) == ESP_OK )
-    {
-        net_cert_dates_say(tls_flags, url);
-    }
+    /* What it returns is the last error itself, not whether it could be read:
+     * after a refused handshake it is never ESP_OK. The code stays 0 when
+     * nothing was kept. */
+    (void)esp_http_client_get_and_clear_last_tls_error(h, &tls_code, &tls_flags);
+    net_cert_refused_say(tls_code, url);
 }
 
 /** @brief The open stream's Content-Range, kept by its event hook: one stream at a time. */
@@ -1702,8 +1695,8 @@ static void mqtt_event(void *args, esp_event_base_t base, int32_t id,
                        refused);
                 if ( NULL != ev->error_handle )
                 {
-                    net_cert_dates_say(ev->error_handle->esp_tls_cert_verify_flags,
-                                       s_mqtt.uri);
+                    net_cert_refused_say(ev->error_handle->esp_tls_stack_err,
+                                         s_mqtt.uri);
                 }
             }
             if ( 0 != refused )
