@@ -147,6 +147,10 @@ typedef struct {
  * @brief GET @p url into @p buf. Blocks. https:// verifies against the
  *        Mozilla certificate bundle.
  *
+ * The certificate's dates are checked against the wall clock, so every
+ * https:// request fails until the clock is set: each certificate is then
+ * not valid yet. The same holds for every TLS connection in this file.
+ *
  * A 404 is a successful call: the server answered, and @c status carries what
  * it said. KODE_OK means the transport worked, nothing more - conflating the
  * two would leave a caller unable to tell "no such page" from "no network".

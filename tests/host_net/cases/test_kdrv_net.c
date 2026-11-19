@@ -9,6 +9,7 @@
 
 #include "Mockesp_http_client.h"
 #include "Mockping_sock.h"
+#include "mbedtls/x509.h"
 
 #include "kdrv_net.h"
 #include "host_spies.h"
@@ -783,6 +784,7 @@ TEST_CASE("a kept PUT that fails does not keep its handle", "[kdrv_net]")
     esp_http_client_init_Stub(put_init_stub);
     put_expect_headers(h);
     esp_http_client_open_ExpectAndReturn(h, (int)PUT_BODY_LEN, ESP_FAIL);
+    esp_http_client_get_and_clear_last_tls_error_ExpectAnyArgsAndReturn(ESP_OK);
     esp_http_client_cleanup_ExpectAndReturn(h, ESP_OK);
     put_run(PUT_URL, true);
     TEST_ASSERT_EQUAL_INT(KODE_ERROR, s_rc);
@@ -1036,6 +1038,7 @@ TEST_CASE("no copy of the link stays in PSRAM after a PUT that keeps nothing",
     /* A PUT that failed keeps nothing either. */
     put_expect_headers(h);
     esp_http_client_open_ExpectAndReturn(h, (int)PUT_BODY_LEN, ESP_FAIL);
+    esp_http_client_get_and_clear_last_tls_error_ExpectAnyArgsAndReturn(ESP_OK);
     esp_http_client_cleanup_ExpectAndReturn(h, ESP_OK);
     put_run(PUT_URL, true);
     TEST_ASSERT_EQUAL_INT(KODE_ERROR, s_rc);
@@ -1187,6 +1190,134 @@ TEST_CASE("a stream open logs the URL without its query", "[kdrv_net]")
 
     Mockesp_http_client_Destroy();
     release_stream();
+}
+
+/* ---- A certificate refused for its dates ----------------------------------- */
+
+/** @brief mbedTLS's BADCERT_NOT_TRUSTED: a refusal that is not about dates. */
+#define CERT_NOT_TRUSTED  0x08
+
+/** @brief A wall clock as kdrv_clocks_wall_iso() writes it. */
+#define CERT_CLOCK        "2026-11-19T10:00:00Z"
+
+/**
+ * @brief Run a PUT whose connection is refused, the TLS layer reporting
+ *        @p flags of the certificate's verification.
+ */
+static void cert_put_refused(int flags)
+{
+    esp_http_client_handle_t const h = (esp_http_client_handle_t)&s_put_token;
+    static int                     s_flags;
+
+    s_flags = flags;
+    (void)memset(&s_init_seen, 0, sizeof(s_init_seen));
+    s_init_seen.hand_out = h;
+    log_stub_forget();
+
+    Mockesp_http_client_Init();
+    esp_http_client_init_Stub(put_init_stub);
+    put_expect_headers(h);
+    esp_http_client_open_ExpectAndReturn(h, (int)PUT_BODY_LEN, ESP_FAIL);
+    esp_http_client_get_and_clear_last_tls_error_ExpectAnyArgsAndReturn(ESP_OK);
+    esp_http_client_get_and_clear_last_tls_error_ReturnThruPtr_esp_tls_flags(&s_flags);
+    esp_http_client_cleanup_ExpectAndReturn(h, ESP_OK);
+    put_run(PUT_URL, false);
+    TEST_ASSERT_EQUAL_INT(KODE_ERROR, s_rc);
+
+    Mockesp_http_client_Verify();
+    Mockesp_http_client_Destroy();
+}
+
+/* mbedTLS judges the dates against the wall clock, so a refusal for them has
+ * two causes: the certificate, or the clock. The line names the host alone,
+ * never the path (a PUT's path carries its token), and the clock it judged by. */
+TEST_CASE("a certificate refused as expired is said, with the host and the clock",
+          "[kdrv_net]")
+{
+    time_stub_set_wall(CERT_CLOCK, false);
+    cert_put_refused(MBEDTLS_X509_BADCERT_EXPIRED);
+
+    TEST_ASSERT_TRUE_MESSAGE(log_stub_saw("api.example.invalid: its certificate "
+                                          "has expired by the clock (" CERT_CLOCK ")"),
+        "the refusal did not say the certificate had expired");
+    TEST_ASSERT_FALSE_MESSAGE(log_stub_saw("expired by the clock (" CERT_CLOCK ", "),
+        "a clock set by the network was said to be put back");
+
+    time_stub_set_wall(NULL, false);
+}
+
+/* Before the clock is set every certificate is not valid yet: the line says
+ * the clock is not set, which is the cause to look at. */
+TEST_CASE("a certificate not valid yet with no clock says the clock is not set",
+          "[kdrv_net]")
+{
+    time_stub_set_wall(NULL, false);
+    cert_put_refused(MBEDTLS_X509_BADCERT_FUTURE);
+
+    TEST_ASSERT_TRUE(log_stub_saw("api.example.invalid: its certificate "
+                                  "is not valid yet by the clock (not set)"));
+}
+
+TEST_CASE("a refusal by a clock put back after a power cut says so", "[kdrv_net]")
+{
+    time_stub_set_wall(CERT_CLOCK, true);
+    cert_put_refused(MBEDTLS_X509_BADCERT_FUTURE);
+
+    TEST_ASSERT_TRUE(log_stub_saw("is not valid yet by the clock "
+                                  "(" CERT_CLOCK ", put back after a power cut)"));
+
+    time_stub_set_wall(NULL, false);
+}
+
+/* Any other reason is the TLS layer's to tell; this line is about dates. */
+TEST_CASE("a refusal that is not about dates adds no line about the certificate",
+          "[kdrv_net]")
+{
+    time_stub_set_wall(CERT_CLOCK, false);
+    cert_put_refused(CERT_NOT_TRUSTED);
+    TEST_ASSERT_FALSE(log_stub_saw("its certificate"));
+
+    cert_put_refused(0);
+    TEST_ASSERT_FALSE(log_stub_saw("its certificate"));
+
+    time_stub_set_wall(NULL, false);
+}
+
+/** @brief Stands in for a connect the TLS layer refused. */
+static esp_err_t stream_open_refused(esp_http_client_handle_t client, int write_len,
+                                     int num_calls)
+{
+    (void)client; (void)write_len; (void)num_calls;
+    return ESP_FAIL;
+}
+
+/* An install from a URL or Kody's pack opens a stream, not a request: the same
+ * line comes from there. */
+TEST_CASE("a stream refused for an expired certificate says so", "[kdrv_net]")
+{
+    uint32_t  total  = 0U;
+    uint16_t  status = 0U;
+    int       flags  = MBEDTLS_X509_BADCERT_EXPIRED;
+
+    time_stub_set_ms(1000U);
+    time_stub_set_wall(CERT_CLOCK, false);
+    log_stub_forget();
+
+    Mockesp_http_client_Init();
+    esp_http_client_init_Stub(stream_init);
+    esp_http_client_open_Stub(stream_open_refused);
+    esp_http_client_get_and_clear_last_tls_error_ExpectAnyArgsAndReturn(ESP_OK);
+    esp_http_client_get_and_clear_last_tls_error_ReturnThruPtr_esp_tls_flags(&flags);
+    esp_http_client_cleanup_ExpectAndReturn(STREAM_H, ESP_OK);
+
+    TEST_ASSERT_EQUAL_INT(KODE_ERROR,
+        kdrv_net_stream_open("https://example.invalid/app.bin", 0U, &total, &status));
+    TEST_ASSERT_TRUE(log_stub_saw("example.invalid: its certificate has expired "
+                                  "by the clock (" CERT_CLOCK ")"));
+
+    Mockesp_http_client_Verify();
+    Mockesp_http_client_Destroy();
+    time_stub_set_wall(NULL, false);
 }
 
 TEST_CASE("a slow connect leaves the headers only what is left of the budget",

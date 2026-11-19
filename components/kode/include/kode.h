@@ -1545,6 +1545,10 @@ bool kode_ble_pair_open(void);
  * A page that answers 404 is not a failure: its body comes back and
  * kode_http_status() says 404.
  *
+ * An https:// server's certificate is checked against the wall clock, so
+ * every https:// call fails while kode_time_unix() answers -1. Ask again once
+ * the clock is set; the board sets it from the network soon after it joins.
+ *
  * @param url An http:// or https:// address, under KODE_HTTP_URL_MAX bytes.
  * @return The body, valid until this task's next kode_http_get() or
  *         kode_http_post(); "" with kode_error() saying why when there is no
@@ -1663,6 +1667,10 @@ bool kode_udp_send(const char *host, uint16_t port, const void *data, uint32_t l
 
 /**
  * @brief Connect to a broker and wait until it accepts.
+ *
+ * An mqtts:// broker's certificate is checked against the wall clock, as for
+ * kode_http_get(): it fails while kode_time_unix() answers -1.
+ *
  * @param uri mqtt://host[:port] or mqtts://host[:port], up to KODE_MQTT_URI_LIMIT bytes.
  * @return true when connected, or already connected to @p uri; false with kode_error() saying why.
  */

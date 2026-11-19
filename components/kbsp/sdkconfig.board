@@ -141,6 +141,10 @@ CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 # among them, send GTS Root R1 signed by GlobalSign Root CA, which is no
 # longer in the bundle. Costs about 700 bytes of heap per handshake. (ESP-IDF)
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+# Check a server certificate's dates against the wall clock; without it an
+# expired certificate is accepted. Until the clock is set, every certificate
+# is not valid yet and a TLS connection fails. (ESP-IDF)
+CONFIG_MBEDTLS_HAVE_TIME_DATE=y
 # Silent bootloader. (ESP-IDF)
 CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 # DEBUG logs stay compiled, for `log_level`. (ESP-IDF)
