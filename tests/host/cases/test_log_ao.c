@@ -626,7 +626,8 @@ TEST_CASE("the reader retries a full pool, then gives the byte up and counts it"
     fake_console_feed_byte((int)'x');
 
     TEST_ASSERT_EQUAL_UINT32(before_drop + 1U, console_rx_dropped());
-    TEST_ASSERT_GREATER_THAN_UINT32(before_ms, khal_time_ms());
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(KHAL_CONSOLE_TX_HOLD_MS,
+                                        khal_time_ms() - before_ms);
 
     /* Not merely counted: nothing was posted either. A queue that somehow
      * got an event here would mean the byte was both dropped and kept. */
@@ -634,6 +635,54 @@ TEST_CASE("the reader retries a full pool, then gives the byte up and counts it"
     TEST_ASSERT_NOT_EQUAL_INT(pdTRUE, xQueueReceive(AO_Log->eQueue, &stray, 0U));
 
     drain_pool(held, n);
+}
+
+/* What wedge_release() holds, and the time it counts from. */
+static const QEvt *s_wedge[RX_FILL_MAX];
+static size_t      s_wedge_n;
+static uint32_t    s_wedge_from_ms;
+
+/** @brief Keep the pool full until a write to the cable would have let AO_Log go, then free it. */
+static void wedge_release(void)
+{
+    if ( (khal_time_ms() - s_wedge_from_ms) < KHAL_CONSOLE_TX_WAIT_MS )
+    {
+        fake_time_delay_hook(&wedge_release);
+    }
+    else
+    {
+        drain_pool(s_wedge, s_wedge_n);
+        s_wedge_n = 0U;
+    }
+}
+
+/* A host that stops reading its output holds AO_Log in a write to the cable
+ * for KHAL_CONSOLE_TX_WAIT_MS, while the cable makes the host wait. The
+ * reader waits it out too: the byte arrives and nothing is counted. */
+TEST_CASE("the reader outlasts a write to the cable that holds AO_Log",
+          "[log_ao]")
+{
+    log_fresh();
+    reader_ready();
+
+    s_wedge_n = fill_pool(s_wedge);
+    TEST_ASSERT_GREATER_THAN_UINT(0U, s_wedge_n);
+    s_wedge_from_ms = khal_time_ms();
+    uint32_t const before_drop = console_rx_dropped();
+    fake_time_delay_hook(&wedge_release);
+
+    fake_console_feed_byte((int)'q');
+
+    TEST_ASSERT_EQUAL_UINT32(before_drop, console_rx_dropped());
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(KHAL_CONSOLE_TX_WAIT_MS,
+                                        khal_time_ms() - s_wedge_from_ms);
+    const QEvt *e = NULL;
+    TEST_ASSERT_EQUAL_INT(pdTRUE, xQueueReceive(AO_Log->eQueue, &e, 0U));
+    TEST_ASSERT_EQUAL_INT(CONSOLE_BYTE_SIG, e->sig);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)'q', ((ConsoleByteEvt const *)e)->byte);
+    QF_gc(e);
+
+    fake_time_delay_hook(NULL);
 }
 
 /* The byte path leaves KQP_BYTE_POOL_MARGIN blocks to everybody else: with

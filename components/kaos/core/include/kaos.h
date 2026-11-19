@@ -2627,7 +2627,9 @@ uint32_t log_dropped(void);
  * @brief Bytes the console's input side lost outright.
  *
  * Bytes that never became an event on the way in, past the reader's bounded
- * retry (log_dropped() counts the way out). `ps` reports both.
+ * retry. On the way out, log_dropped() counts the lines AO_Log could not take
+ * and khal_console_tx_dropped() the bytes the cable dropped while its host was
+ * not reading. `ps` reports all three.
  *
  * @return How many bytes were lost since boot. Only ever grows.
  */
